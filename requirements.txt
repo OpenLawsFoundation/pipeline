@@ -1,3 +1,6 @@
 requests>=2.32
 lxml>=5.2
 PyYAML>=6.0
+# Lets requests honor a system-provided SOCKS proxy (e.g. ALL_PROXY=socks5h://…
+# set by a self-hosted runner's egress). No proxy is configured in code.
+PySocks>=1.7.1
