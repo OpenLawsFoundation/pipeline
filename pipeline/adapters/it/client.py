@@ -8,8 +8,10 @@ The API exposes three capabilities this adapter uses:
 
   1. INCREMENTAL DISCOVERY — ``POST /api/v1/ricerca/aggiornati`` returns every act
      whose ``dataUltimaModifica`` falls in a date window (window must be <= 12
-     months, <= 7000 results). No URN field is returned; we *construct* the NIR
-     URN from the act's denomination + provvedimento date/number.
+     months, <= 7000 results). No URN field is returned, and we no longer construct
+     one: discovery yields the act's source *coordinates* (denominazione, anno,
+     numero, codiceRedazionale, dataGU) on an ``ActRef`` whose canonical identity
+     is filled in later, from the fetched AKN, during transform.
 
   2. BACKFILL ENUMERATION — ``POST /api/v1/ricerca/avanzata`` with just
      ``annoProvvedimento`` (no text) enumerates ALL acts of that year, paginated.
@@ -44,7 +46,6 @@ from xml.etree import ElementTree as ET
 import requests
 
 from ..base import ActRef
-from . import urn as urnlib
 from .config import load as load_config
 
 # Fallback constants (used only if config.yaml is absent). The live values come
@@ -82,6 +83,13 @@ class NormattivaError(RuntimeError):
     def __init__(self, message: str, code: int | None = None):
         super().__init__(message)
         self.code = code
+
+
+class _ThrottledError(RuntimeError):
+    """Internal signal: the export submit is globally throttled (409/429) even
+    after backing off. The batch loop catches this to STOP submitting cleanly and
+    finish collecting whatever was already submitted — it is never propagated as a
+    fatal error and never reaches the runner."""
 
 
 class NormattivaClient:
@@ -135,10 +143,12 @@ class NormattivaClient:
           ``_BACKFILL_START_YEAR``, paginating each year until
           ``paginaCorrente >= numeroPagine``. Most-recent acts are yielded first.
 
-        For each act we *construct* the NIR URN from its denomination + date +
-        number (the API returns no URN). An item whose denomination is not in the
-        type map is skipped with a warning to stderr — one unknown type must not
-        abort the whole run.
+        For each act we yield an :class:`ActRef` carrying its source COORDINATES
+        (denominazione, anno, numero, codiceRedazionale, dataGU) — never a
+        constructed identity. EVERY act flows through; nothing is skipped on an
+        unmapped denomination, because identity is no longer inferred from the
+        label. The canonical olf_id / native_urn are derived later from the
+        fetched AKN's ``<FRBRWork>`` during transform.
 
         NOTE: a full-corpus AKN export (per-act async export) is heavy; this
         method only enumerates ``ActRef``s. Bulk AKN export optimisation is out
@@ -217,28 +227,24 @@ class NormattivaClient:
             page = current + 1
 
     def _items_to_refs(self, items: list[dict]) -> Iterator[ActRef]:
+        """Map raw search items to ActRefs carrying source coordinates only.
+
+        Identity (olf_id / native_urn) is left ``None`` — it is derived from the
+        fetched AKN during transform, not inferred from the search label. EVERY
+        item yields a ref; nothing is skipped on an unmapped denomination.
+        """
         for it in items:
-            denom = it.get("denominazioneAtto")
-            try:
-                native_urn = urnlib.build_nir_urn(
-                    denom,
-                    it.get("annoProvvedimento"),
-                    it.get("meseProvvedimento"),
-                    it.get("giornoProvvedimento"),
-                    str(it.get("numeroProvvedimento")),
-                )
-                olf_id = urnlib.to_olf_id(native_urn)
-            except ValueError as exc:
-                print(
-                    f"[normattiva] skipping act with unmapped denomination "
-                    f"{denom!r}: {exc}",
-                    file=sys.stderr,
-                )
-                continue
+            numero = it.get("numeroProvvedimento")
             yield ActRef(
-                olf_id=olf_id,
-                native_urn=native_urn,
+                olf_id=None,
+                native_urn=None,
                 source_modified=_parse_dt(it.get("dataUltimaModifica")),
+                denominazione=it.get("denominazioneAtto"),
+                anno=(str(it.get("annoProvvedimento"))
+                      if it.get("annoProvvedimento") is not None else None),
+                numero=(str(numero) if numero is not None else None),
+                codice_redazionale=it.get("codiceRedazionale"),
+                data_gu=it.get("dataGU"),
             )
 
     # --- fetch -----------------------------------------------------------
@@ -246,17 +252,17 @@ class NormattivaClient:
     def fetch_akn(self, ref: ActRef) -> tuple[bytes, str]:
         """Return ``(akn_bytes, source_url)`` for one act via the async export.
 
-        The native URN is decomposed (``urn.parse``) into act type / year /
-        number, the NIR type slug is mapped back to the API's ``denominazioneAtto``
-        and fed into the four-step asynchronous export:
+        The ref's source COORDINATES (``denominazione`` / ``anno`` / ``numero``)
+        are fed directly into the four-step asynchronous export — no URN
+        round-trip, no label→slug guessing:
 
           1. POST ``ricerca-asincrona/nuova-ricerca`` -> 202 + token (UUID text).
           2. PUT ``ricerca-asincrona/conferma-ricerca`` ``{"token": ...}``.
           3. Poll GET ``ricerca-asincrona/check-status/<token>`` until HTTP 303;
              the download URL is in the ``x-ipzs-location`` response header.
-          4. GET the download URL -> a ZIP of AKN XML; the entry whose
-             ``FRBRalias`` urn:nir equals ``ref.native_urn`` is returned (else the
-             first ``.xml`` entry).
+          4. GET the download URL -> a ZIP of AKN XML; the entry/folder whose
+             name embeds ``ref.codice_redazionale`` is selected, then the latest
+             VIGENZA-≤-today version of that act is returned.
 
         ``source_url`` is the ``x-ipzs-location`` download URL (provenance).
 
@@ -292,9 +298,14 @@ class NormattivaClient:
         concurrency is entirely server-side.
 
         Phase 1 — submit all:
-            For each ref call ``_submit_export`` (throttled).  If a ref raises
-            ``NormattivaError`` (e.g. unmapped denomination slug), log a warning
-            to stderr and skip it.  All other refs are added to ``pending``.
+            For each ref call ``_submit_export`` (throttled).  A per-act submit
+            failure (``NormattivaError`` / ``ValueError``) is logged and skipped —
+            never fatal.  Normattiva's GLOBAL throttle, however, is a 409/429
+            ``HTTPError`` on the nuova-ricerca submit: we back off a few times
+            (respecting ``Retry-After``); if still throttled we STOP submitting
+            further refs, log a clean-stop message, and proceed to collect
+            whatever was already submitted.  The run thus exits 0 with everything
+            it built — an idempotent re-run resumes from where the throttle hit.
 
         Phase 2 — collect:
             Loop until ``pending`` is empty or ``export_max_wait_seconds`` elapses
@@ -307,18 +318,28 @@ class NormattivaClient:
         the caller will re-encounter them on the next incremental run via the
         overlap window, so this is an honest, recoverable skip.
         """
-        # --- Phase 1: submit all ------------------------------------------
+        # --- Phase 1: submit all (stop cleanly if globally throttled) ------
         pending: dict[str, ActRef] = {}  # token -> ref
+        submitted = 0
         for ref in refs:
             try:
                 token = self._submit_export(ref)
+            except _ThrottledError as exc:
+                # Global throttle: stop submitting, keep what we have.
+                print(
+                    f"[normattiva] batch: throttled after {submitted} submitted "
+                    f"({exc}) — stopping cleanly, will resume next run",
+                    file=sys.stderr,
+                )
+                break
             except (NormattivaError, ValueError) as exc:
                 print(
-                    f"[normattiva] batch: skipping {ref.olf_id!r} (submit failed): {exc}",
+                    f"[normattiva] batch: skipping {_ref_label(ref)} (submit failed): {exc}",
                     file=sys.stderr,
                 )
                 continue
             pending[token] = ref
+            submitted += 1
 
         if not pending:
             return
@@ -331,12 +352,24 @@ class NormattivaClient:
             newly_ready = 0
             for token, ref in list(pending.items()):
                 self._throttle()
-                url = self._check_export(token)
-                if url is not None:
+                try:
+                    url = self._check_export(token)
+                    if url is None:
+                        continue  # still processing; try again next round
                     akn_bytes, source_url = self._download_akn_url(url, ref)
+                except Exception as exc:  # noqa: BLE001
+                    # Per-act poll/download error: log and drop this token. Never
+                    # fatal — the act re-surfaces on the next incremental run.
+                    print(
+                        f"[normattiva] batch: skipping {_ref_label(ref)} "
+                        f"(poll/download failed): {exc}",
+                        file=sys.stderr,
+                    )
                     del pending[token]
-                    newly_ready += 1
-                    yield (ref, akn_bytes, source_url)
+                    continue
+                del pending[token]
+                newly_ready += 1
+                yield (ref, akn_bytes, source_url)
             if pending and newly_ready == 0:
                 # Nothing became ready this round; sleep before the next sweep.
                 remaining = deadline - time.monotonic()
@@ -345,7 +378,7 @@ class NormattivaClient:
 
         # Any tokens still pending hit the deadline.
         if pending:
-            timed_out = [ref.olf_id for ref in pending.values()]
+            timed_out = [_ref_label(ref) for ref in pending.values()]
             print(
                 f"[normattiva] batch: export deadline reached; "
                 f"{len(timed_out)} ref(s) timed out and will be retried on the "
@@ -358,16 +391,25 @@ class NormattivaClient:
     def _submit_export(self, ref: ActRef) -> str:
         """Submit the two-step nuova-ricerca + conferma-ricerca for one ref.
 
+        Uses the ref's source COORDINATES (``denominazione`` / ``anno`` /
+        ``numero``) directly — no URN round-trip, no label→slug guessing. EVERY
+        denomination is forwarded verbatim to Normattiva's own search.
+
         Returns the server-issued export token (UUID string).  Raises
-        ``NormattivaError`` if the denomination slug cannot be mapped or the
-        API returns an error response.
+        ``NormattivaError`` if the API returns an error response, or
+        ``_ThrottledError`` if the submit is globally throttled (409/429) even
+        after backing off — the caller treats that as a clean stop signal.
         """
-        p = urnlib.parse(ref.native_urn)
-        try:
-            denominazione = urnlib.denominazione_for_nir_slug(p.act_type)
-        except ValueError as exc:
-            raise NormattivaError(str(exc)) from exc
-        token = self._export_new_search(denominazione, p.year, p.number)
+        denominazione = ref.denominazione
+        if not denominazione:
+            raise NormattivaError(
+                f"ActRef has no denominazione coordinate to submit: {_ref_label(ref)}"
+            )
+        if not ref.anno or not ref.numero:
+            raise NormattivaError(
+                f"ActRef missing anno/numero coordinate to submit: {_ref_label(ref)}"
+            )
+        token = self._export_new_search(denominazione, ref.anno, ref.numero)
         self._export_confirm(token)
         return token
 
@@ -397,24 +439,94 @@ class NormattivaClient:
     def _download_akn_url(self, download_url: str, ref: ActRef) -> tuple[bytes, str]:
         """GET the ZIP at ``download_url``, extract and return ``(bytes, url)``.
 
-        The entry whose ``FRBRalias`` urn:nir equals ``ref.native_urn`` is
-        preferred; otherwise the first ``.xml`` entry is returned.
+        Selection matches the act by ``ref.codice_redazionale`` (embedded in the
+        ZIP entry/folder names) and then the latest-VIGENZA-≤-today version; see
+        :func:`_extract_akn_from_zip`.
         """
         self._throttle()
         r = self.session.get(download_url, timeout=self.timeout)
         r.raise_for_status()
-        akn_bytes = _extract_akn_from_zip(r.content, ref.native_urn)
+        akn_bytes = _extract_akn_from_zip(r.content, ref)
         return akn_bytes, download_url
 
-    def _export_new_search(self, denominazione: str, year: int, number: str) -> str:
-        self._throttle()
+    # Backoff schedule (seconds) for a globally-throttled nuova-ricerca submit.
+    _THROTTLE_BACKOFFS = (5.0, 10.0, 20.0)
+    # HTTP status codes that mean "you are being throttled, back off".
+    _THROTTLE_STATUS = (409, 429)
+
+    def _post_with_throttle_backoff(self, url: str, *, json: dict):
+        """POST ``url`` (throttled), retrying on 409/429 with exponential backoff.
+
+        Each attempt is preceded by the normal good-citizen ``_throttle``. On a
+        throttle response we sleep the next backoff step (honoring ``Retry-After``
+        if the server sends one), then retry. After the schedule is exhausted we
+        raise :class:`_ThrottledError` carrying the last status — the batch loop
+        treats that as a clean stop-and-resume signal rather than a crash.
+
+        Any non-throttle HTTPError propagates unchanged (per-act, handled by the
+        caller as a normal skip).
+        """
+        last_status: int | None = None
+        # len(backoffs)+1 attempts: an initial try plus one retry per backoff step.
+        for attempt in range(len(self._THROTTLE_BACKOFFS) + 1):
+            self._throttle()
+            r = self.session.post(url, json=json, timeout=self.timeout)
+            try:
+                r.raise_for_status()
+            except requests.HTTPError as exc:
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                if status not in self._THROTTLE_STATUS:
+                    raise
+                last_status = status
+                if attempt >= len(self._THROTTLE_BACKOFFS):
+                    break  # schedule exhausted; give up below
+                retry_after = self._retry_after_seconds(r)
+                sleep_s = (
+                    retry_after if retry_after is not None
+                    else self._THROTTLE_BACKOFFS[attempt]
+                )
+                print(
+                    f"[normattiva] throttled ({status}) on nuova-ricerca; "
+                    f"backing off {sleep_s:.0f}s (attempt {attempt + 1})",
+                    file=sys.stderr,
+                )
+                time.sleep(sleep_s)
+                continue
+            return r
+        raise _ThrottledError(
+            f"nuova-ricerca still throttled (HTTP {last_status}) after "
+            f"{len(self._THROTTLE_BACKOFFS)} backoffs"
+        )
+
+    @staticmethod
+    def _retry_after_seconds(response) -> float | None:
+        """Parse a ``Retry-After`` header (delta-seconds form) to a float, or None."""
+        raw = response.headers.get("Retry-After") if response is not None else None
+        if not raw:
+            return None
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            return None
+
+    def _export_new_search(self, denominazione: str, anno: str, numero: str) -> str:
+        """POST nuova-ricerca with the act's source coordinates.
+
+        ``denominazione`` / ``anno`` / ``numero`` come straight from the ActRef's
+        search coordinates — there is no URN parse and no slug reverse-lookup.
+
+        On Normattiva's global throttle (HTTP 409/429) this retries with
+        exponential backoff (5s → 10s → 20s, a few tries, honoring ``Retry-After``
+        when present); if still throttled it raises :class:`_ThrottledError` so the
+        batch can stop cleanly and resume on the next run.
+        """
         body = {
             "formato": "AKN",
             "tipoRicerca": "A",
             "parametriRicerca": {
                 "denominazioneAtto": denominazione,
-                "annoProvvedimento": f"{year:04d}",
-                "numeroProvvedimento": str(number),
+                "annoProvvedimento": str(anno),
+                "numeroProvvedimento": str(numero),
                 "orderType": "recente",
                 "paginazione": {
                     "paginaCorrente": 1,
@@ -423,12 +535,10 @@ class NormattivaClient:
             },
         }
         body["richiestaExport"] = "M" if self.multivigente else "O"
-        r = self.session.post(
+        r = self._post_with_throttle_backoff(
             f"{self.base_url}/api/v1/ricerca-asincrona/nuova-ricerca",
             json=body,
-            timeout=self.timeout,
         )
-        r.raise_for_status()
         text = r.text.strip()
         # A JSON body here means an error (e.g. {"code": 1003}); a bare UUID string
         # is the happy path.
@@ -491,41 +601,57 @@ def _raise_for_api_error(data: object) -> None:
     raise NormattivaError(f"Normattiva API error {code}: {message}", code=code_int)
 
 
-def _extract_akn_from_zip(content: bytes, native_urn: str) -> bytes:
+def _extract_akn_from_zip(content: bytes, ref: ActRef) -> bytes:
     """Pull the current consolidated AKN XML out of a Normattiva export ZIP.
 
     Normattiva ships ``richiestaExport:"M"`` (multivigente) results as a ZIP of
     SEPARATE per-version files, one per consolidation point, e.g.:
 
-        DECRETO-LEGGE_20060403_152/..._ORIGINALE_V0.xml
-        DECRETO-LEGGE_20060403_152/..._VIGENZA_2006-07-13_V1.xml
-        DECRETO-LEGGE_20060403_152/..._VIGENZA_2021-06-01_V141.xml
+        DECRETO-LEGGE_20060403_152_..._06G00110_ORIGINALE_V0.xml
+        DECRETO-LEGGE_20060403_152_..._06G00110_VIGENZA_2006-07-13_V1.xml
+        DECRETO-LEGGE_20060403_152_..._06G00110_VIGENZA_2021-06-01_V141.xml
         ...
 
-    We archive the CURRENT consolidated version — the latest VIGENZA entry whose
-    date is not in the future (≤ today UTC).  That file itself carries the full
-    amendment history in its ``<lifecycle>``/``<analysis>`` blocks, so
-    downstream transforms see all amendment events without needing to reassemble
-    all versions.  Assembling every version into one temporal AKN document is a
-    separate future concern and out of scope here.
+    A single export can contain MORE THAN ONE act (the search may match several);
+    every entry name embeds the act's ``codiceRedazionale`` (e.g. ``_24G00035_``).
+    We therefore FIRST narrow to the act we asked for by matching
+    ``ref.codice_redazionale`` against the entry names, and only then pick the
+    CURRENT consolidated version — the latest VIGENZA entry whose date is not in
+    the future (≤ today UTC).  That file itself carries the full amendment history
+    in its ``<lifecycle>``/``<analysis>`` blocks, so downstream transforms see all
+    amendment events without reassembling versions.  Assembling every version into
+    one temporal AKN document is a separate future concern and out of scope here.
 
     Selection algorithm:
+      0. If ``ref.codice_redazionale`` is set and at least one entry name contains
+         it, restrict the candidate entries to that act; otherwise keep all
+         entries (best-effort fallback for codice-less refs / odd exports).
       1. Parse each ``_VIGENZA_<YYYY-MM-DD>_V<n>`` entry; collect (date, n, name).
       2. Keep only those with date ≤ today UTC.
       3. Pick the one with the latest date; tie-break on highest V<n>.
       4. If no VIGENZA entries pass the filter (un-amended act — only ORIGINALE),
          use the ORIGINALE_V0 entry.
       5. If filenames don't match either pattern at all, fall back to
-         FRBRalias-match then first-xml (legacy safety net).
+         FRBRalias-match (against ``ref.native_urn`` when known) then first-xml.
     """
     import re
 
     today = datetime.now(timezone.utc).date()
+    native_urn = ref.native_urn  # usually None now (identity derived later)
+    codice = (ref.codice_redazionale or "").strip()
 
     with zipfile.ZipFile(io.BytesIO(content)) as zf:
-        xml_names = [n for n in zf.namelist() if n.lower().endswith(".xml")]
-        if not xml_names:
+        all_xml_names = [n for n in zf.namelist() if n.lower().endswith(".xml")]
+        if not all_xml_names:
             raise NormattivaError("Export ZIP contains no .xml entry")
+
+        # Step 0: narrow to the requested act by codiceRedazionale when possible.
+        xml_names = all_xml_names
+        if codice:
+            matched = [n for n in all_xml_names if codice.lower() in n.lower()]
+            if matched:
+                xml_names = matched
+
         if len(xml_names) == 1:
             return zf.read(xml_names[0])
 
@@ -562,12 +688,14 @@ def _extract_akn_from_zip(content: bytes, native_urn: str) -> bytes:
             return zf.read(originale_name)
 
         # --- legacy fallback: FRBRalias-match then first-xml -----------------
+        # native_urn is usually None now (identity is derived later); only do the
+        # equality match when we actually have a urn to match against.
         first_bytes: bytes | None = None
         for name in xml_names:
             raw = zf.read(name)
             if first_bytes is None:
                 first_bytes = raw
-            if _akn_urn(raw) == native_urn:
+            if native_urn and _akn_urn(raw) == native_urn:
                 return raw
         return first_bytes if first_bytes is not None else zf.read(xml_names[0])
 
@@ -609,3 +737,19 @@ def _parse_dt(value) -> datetime | None:
         return datetime.fromisoformat(value)
     except ValueError:
         return None
+
+
+def _ref_label(ref: ActRef) -> str:
+    """A human-readable label for logs.
+
+    Identity (olf_id) is derived later, so before transform an ActRef carries only
+    coordinates. Prefer the olf_id when present, else fall back to the coordinates
+    that uniquely point at the act in the source system.
+    """
+    if ref.olf_id:
+        return ref.olf_id
+    parts = [p for p in (ref.denominazione, ref.anno, ref.numero) if p]
+    coord = " ".join(parts) if parts else "?"
+    if ref.codice_redazionale:
+        coord += f" [{ref.codice_redazionale}]"
+    return coord
