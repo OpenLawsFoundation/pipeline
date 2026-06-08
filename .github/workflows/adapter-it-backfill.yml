@@ -1,10 +1,9 @@
 name: adapter-it-backfill
 
 # One-shot full import: the "alba dei tempi" snapshot of the whole Italian corpus.
-# Manual only. This is a single ACQUISITION event, not retroactive git history:
-# each file is born already multivigente (the full legal time-history lives
-# INSIDE the AKN), so this produces one big commit/PR "Italy imported at <date>",
-# not 200k dated commits.
+# Manual only. The runner commits one act per commit directly to the archive repo,
+# so the archive's history grows act by act during the run. Each act is
+# multivigente: its entire legal time-history lives INSIDE the AKN document.
 #
 # A full corpus walk can exceed Actions' job time limit. If it does, run this on
 # a self-hosted runner (set runs-on accordingly) — the runner.run code is the
@@ -57,18 +56,7 @@ jobs:
           python -m adapters.runner.run \
             --jurisdiction it \
             --archive "${GITHUB_WORKSPACE}/archive" \
-            --backfill
-
-      - name: Open PR to archive
-        uses: peter-evans/create-pull-request@v6
-        with:
-          path: archive
-          token: ${{ secrets.ARCHIVE_WRITE_TOKEN }}
-          branch: auto/it-backfill
-          commit-message: "it: initial backfill from Normattiva"
-          title: "Italy — initial backfill (acquisition snapshot)"
-          body: |
-            Full initial import of the Italian corpus from Normattiva.
-            Each act is multivigente: its entire legal history is contained in
-            the document, not in git history. This PR is the acquisition event.
-          labels: jurisdiction:it, backfill, automated
+            --backfill \
+            --commit --push \
+            --git-name "normattiva-adapter" \
+            --git-email "normattiva-adapter@users.noreply.github.com"

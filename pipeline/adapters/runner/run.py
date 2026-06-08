@@ -1,8 +1,10 @@
 """Generic runner. Loads a jurisdiction adapter, walks discover->fetch->transform,
 and writes AKN4OLF documents into a local checkout of the `archive` repo.
 
-It does NOT commit. Committing/PRing is the workflow's job, so the same runner
-works locally, on a real backfill runner, and inside GitHub Actions.
+By default it does NOT commit. Pass --commit to create one git commit per act
+written (skipping acts whose bytes are identical to what is already committed),
+and --push to push each commit to the archive remote immediately after it is made.
+--push implies --commit.
 
 Layout written into the archive:
 
@@ -11,12 +13,16 @@ Layout written into the archive:
 Usage (must be run from the inner `pipeline/` directory that contains `adapters/`):
     python -m adapters.runner.run --jurisdiction it --archive /path/to/archive [--since ISO8601]
     python -m adapters.runner.run --jurisdiction it --archive /path/to/archive --backfill
+    python -m adapters.runner.run --jurisdiction it --archive /path/to/archive --since ISO8601 \\
+        --commit --push --git-name "normattiva-adapter" \\
+        --git-email "normattiva-adapter@users.noreply.github.com"
 """
 
 from __future__ import annotations
 
 import argparse
 import importlib
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -35,7 +41,26 @@ def archive_path(archive_root: Path, olf_id: str) -> Path:
     return archive_root / (body + ".akn.xml")
 
 
-def run(jurisdiction: str, archive_root: Path, since: datetime | None) -> int:
+def _git(archive_root: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    """Run `git -C <archive_root> <args>` and return the CompletedProcess."""
+    return subprocess.run(
+        ["git", "-C", str(archive_root), *args],
+        capture_output=True,
+        text=True,
+        check=check,
+    )
+
+
+def run(
+    jurisdiction: str,
+    archive_root: Path,
+    since: datetime | None,
+    *,
+    commit: bool = False,
+    push: bool = False,
+    git_name: str | None = None,
+    git_email: str | None = None,
+) -> int:
     adapter = load_adapter(jurisdiction)
     print(f"adapter {adapter.name}@{adapter.version} | since={since or 'BACKFILL'}")
 
@@ -44,7 +69,47 @@ def run(jurisdiction: str, archive_root: Path, since: datetime | None) -> int:
     refs = list(adapter.discover(since))
     total = len(refs)
 
-    written = errors = 0
+    written = errors = committed = pushed = 0
+
+    def _commit_doc(out: Path, olf_id: str) -> None:
+        """Git-add the file and commit it if the content actually changed."""
+        nonlocal committed, pushed
+
+        # Stage the file using its path relative to the archive root.
+        rel = out.relative_to(archive_root)
+        _git(archive_root, "add", "--", str(rel))
+
+        # Check whether anything is staged; returncode 0 means no diff → skip.
+        result = _git(archive_root, "diff", "--cached", "--quiet", check=False)
+        if result.returncode == 0:
+            # Identical bytes already in the tree — idempotent, do not commit.
+            return
+
+        # Build commit command with optional identity overrides.
+        commit_cmd: list[str] = []
+        if git_name:
+            commit_cmd += ["-c", f"user.name={git_name}"]
+        if git_email:
+            commit_cmd += ["-c", f"user.email={git_email}"]
+        commit_cmd += ["commit", "-m", f"it: {olf_id}"]
+        _git(archive_root, *commit_cmd)
+        committed += 1
+
+        if push:
+            for attempt in range(2):
+                push_result = _git(archive_root, "push", check=False)
+                if push_result.returncode == 0:
+                    pushed += 1
+                    break
+                if attempt == 0:
+                    # Retry once on transient failure.
+                    continue
+                # Second failure: warn and continue — the next push will carry
+                # this commit along.
+                print(
+                    f"  WARN push failed for {olf_id}: {push_result.stderr.strip()}",
+                    file=sys.stderr,
+                )
 
     def _write_doc(source_doc) -> None:
         """Transform one SourceDocument and write it; updates written/errors."""
@@ -64,6 +129,8 @@ def run(jurisdiction: str, archive_root: Path, since: datetime | None) -> int:
         out.write_bytes(doc.akn_xml)
         written += 1
         print(f"  ok   {doc.ref.olf_id}  ({doc.provenance.source_sha256[:12]})")
+        if commit:
+            _commit_doc(out, doc.ref.olf_id)
 
     if hasattr(adapter, "fetch_many"):
         # Batch path: all export jobs are submitted first; the server processes
@@ -85,7 +152,12 @@ def run(jurisdiction: str, archive_root: Path, since: datetime | None) -> int:
     # skipped = refs that were discovered but never produced a SourceDocument
     # (submit failures or batch timeouts); errors = transform failures.
     skipped = total - written - errors
-    print(f"done: {written} written, {errors} errors, {skipped} skipped (of {total})")
+    summary = f"done: {written} written, {errors} errors, {skipped} skipped (of {total})"
+    if commit:
+        summary += f", {committed} committed"
+    if push:
+        summary += f", {pushed} pushed"
+    print(summary)
     # Return 1 only on systemic failure: if every act failed to produce output
     # and there was actually something to process, something is deeply wrong.
     # Per-act errors are reported but not fatal — one bad source act must not
@@ -99,14 +171,38 @@ def main() -> int:
     ap.add_argument("--archive", required=True, type=Path)
     ap.add_argument("--since", help="ISO8601; omit with --backfill")
     ap.add_argument("--backfill", action="store_true")
+    ap.add_argument(
+        "--commit",
+        action="store_true",
+        help="git-add + git-commit each act as it is written",
+    )
+    ap.add_argument(
+        "--push",
+        action="store_true",
+        help="git push after each commit (implies --commit)",
+    )
+    ap.add_argument("--git-name", help="committer name for this run")
+    ap.add_argument("--git-email", help="committer email for this run")
     args = ap.parse_args()
 
     if args.backfill and args.since:
         ap.error("--backfill and --since are mutually exclusive")
+
+    do_commit = args.commit or args.push
+    do_push = args.push
+
     since = None if args.backfill else (
         datetime.fromisoformat(args.since) if args.since else None
     )
-    return run(args.jurisdiction, args.archive, since)
+    return run(
+        args.jurisdiction,
+        args.archive,
+        since,
+        commit=do_commit,
+        push=do_push,
+        git_name=args.git_name,
+        git_email=args.git_email,
+    )
 
 
 if __name__ == "__main__":
