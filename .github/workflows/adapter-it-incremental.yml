@@ -1,0 +1,64 @@
+name: adapter-it-incremental
+
+# Daily incremental: "what did Normattiva publish since yesterday?"
+# Small by design — fits inside Actions. The runner commits and pushes one
+# commit per act directly to the archive repo, so the archive history visibly
+# "builds over time". Only acts whose bytes actually changed produce commits
+# (the runner's --cached diff-quiet gate skips identical re-renders).
+
+on:
+  schedule:
+    - cron: "0 4 * * *"   # 04:00 UTC daily
+  workflow_dispatch:       # allow manual trigger
+
+permissions:
+  contents: read
+
+concurrency:
+  group: adapter-it-incremental
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout pipeline
+        uses: actions/checkout@v4
+        with:
+          path: pipeline
+
+      - name: Checkout archive (target repo)
+        uses: actions/checkout@v4
+        with:
+          repository: OpenLawsFoundation/archive
+          path: archive
+          # Fine-grained PAT or deploy key with write access to the archive repo,
+          # stored as an org/repo secret. Never commit it.
+          token: ${{ secrets.ARCHIVE_WRITE_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        working-directory: pipeline
+        run: pip install -r requirements.txt
+
+      - name: Compute "since" (last successful run)
+        id: since
+        run: echo "value=$(date -u -d '2 days ago' +%Y-%m-%dT%H:%M:%S)" >> "$GITHUB_OUTPUT"
+        # 2-day overlap window absorbs Normattiva's amendment lag (modified acts
+        # land within ~3 days). The transform is idempotent, so re-seeing an
+        # unchanged act produces an identical file and no diff — no commit made.
+
+      - name: Generate AKN4OLF documents
+        working-directory: pipeline/pipeline
+        run: |
+          python -m adapters.runner.run \
+            --jurisdiction it \
+            --archive "${GITHUB_WORKSPACE}/archive" \
+            --since "${{ steps.since.outputs.value }}" \
+            --commit --push \
+            --git-name "normattiva-adapter" \
+            --git-email "normattiva-adapter@users.noreply.github.com"

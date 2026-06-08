@@ -1,0 +1,62 @@
+name: adapter-it-backfill
+
+# One-shot full import: the "alba dei tempi" snapshot of the whole Italian corpus.
+# Manual only. The runner commits one act per commit directly to the archive repo,
+# so the archive's history grows act by act during the run. Each act is
+# multivigente: its entire legal time-history lives INSIDE the AKN document.
+#
+# A full corpus walk can exceed Actions' job time limit. If it does, run this on
+# a self-hosted runner (set runs-on accordingly) — the runner.run code is the
+# same. Actions stays the orchestrator; the heavy lifting can move off it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "Runner to use (ubuntu-latest or a self-hosted label)"
+        default: "ubuntu-latest"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: adapter-it-backfill
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ${{ github.event.inputs.runner }}
+    timeout-minutes: 1440
+    steps:
+      - name: Checkout pipeline
+        uses: actions/checkout@v4
+        with:
+          path: pipeline
+
+      - name: Checkout archive (target repo)
+        uses: actions/checkout@v4
+        with:
+          repository: OpenLawsFoundation/archive
+          path: archive
+          token: ${{ secrets.ARCHIVE_WRITE_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        working-directory: pipeline
+        run: pip install -r requirements.txt
+
+      - name: Full backfill
+        working-directory: pipeline/pipeline
+        run: |
+          python -m adapters.runner.run \
+            --jurisdiction it \
+            --archive "${GITHUB_WORKSPACE}/archive" \
+            --backfill \
+            --commit --push \
+            --git-name "normattiva-adapter" \
+            --git-email "normattiva-adapter@users.noreply.github.com"
