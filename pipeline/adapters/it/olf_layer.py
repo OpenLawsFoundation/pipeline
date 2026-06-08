@@ -4,7 +4,8 @@ This is where "normalize the metadata, not the content" becomes code. We DO NOT
 touch the substantive text, structure, or the native AKN profile produced by
 Normattiva. We only:
 
-  1. stamp the OLF identity (mapped from the NIR URN),
+  1. stamp the OLF identity, DERIVED from the document's own ``<FRBRWork>`` self-id
+     (its native NIR URN and AKN naming-path), never inferred from a search label,
   2. normalize lifecycle events into the AKN4OLF vocabulary,
   3. type the references,
   4. embed provenance.
@@ -16,11 +17,12 @@ from __future__ import annotations
 
 import hashlib
 import re
+from dataclasses import replace
 from datetime import date, datetime, timezone
 
 from lxml import etree
 
-from ..base import OLFDocument, Provenance, SourceDocument, ConformanceError
+from ..base import ActRef, OLFDocument, Provenance, SourceDocument, ConformanceError
 from . import urn as urnlib
 
 AKN_NS = "http://docs.oasis-open.org/legaldocml/ns/akn/3.0"
@@ -39,13 +41,18 @@ def build(doc: SourceDocument, *, adapter_name: str, adapter_version: str) -> OL
     #    idempotent across re-runs.
     _ensure_olf_agent_declared(tree)
 
-    # 1. identity ------------------------------------------------------
-    olf_id = doc.ref.olf_id
+    # 1. identity (CANONICAL-FROM-AKN) ---------------------------------
+    # The act carries its own self-id in <FRBRWork>; derive identity from the
+    # document, never from the search label that produced doc.ref.
+    olf_id, native_urn = _derive_identity(tree, doc.ref)
     _set_olf_meta(tree, "identity", {
         "olfId": olf_id,
-        "nativeUrn": doc.ref.native_urn,
+        "nativeUrn": native_urn,
         "jurisdiction": "it",
     })
+    # Re-point the ref at the DERIVED canonical identity (preserving coordinates)
+    # so the runner writes to the canonical archive path.
+    doc_ref = replace(doc.ref, olf_id=olf_id, native_urn=native_urn)
 
     # 2. lifecycle events ---------------------------------------------
     # Normattiva carries multivigenza in native AKN temporal elements; we read
@@ -84,13 +91,95 @@ def build(doc: SourceDocument, *, adapter_name: str, adapter_version: str) -> OL
     _assert_conformant(akn_xml, olf_id)
 
     return OLFDocument(
-        ref=doc.ref,
+        ref=doc_ref,
         akn_xml=akn_xml,
         provenance=prov,
         in_force_from=in_force_from,
         in_force_to=in_force_to,
         references=refs,
     )
+
+
+# --- identity (canonical-from-AKN) -----------------------------------
+
+
+def _derive_identity(tree: etree._Element, ref: ActRef) -> tuple[str, str | None]:
+    """Derive ``(olf_id, native_urn)`` from the document's own ``<FRBRWork>``.
+
+    This is the heart of the design fix: identity comes from the act's self-id in
+    the fetched Akoma Ntoso, not from the search label that found it.
+
+      * ``native_urn`` := ``FRBRWork/FRBRalias[@name='urn:nir']/@value`` (falling
+        back to any ``FRBRalias`` whose value starts ``urn:nir:``).
+      * ``olf_id``     := :func:`urnlib.akn_uri_to_olf_id` of
+        ``FRBRWork/FRBRuri/@value``; if that yields ``None``,
+        :func:`urnlib.to_olf_id` of ``native_urn``.
+
+    If the AKN carries no usable ``<FRBRWork>`` urn (defensive), we fall back to
+    the values already on ``ref`` (which are normally ``None`` now). If, after all
+    that, no ``olf_id`` can be produced — including the case where the canonical,
+    document-sourced act TYPE is not in our maps — we raise ``ConformanceError``
+    (loud and consistent with this module): an unmappable SELF id must be visible,
+    never silently wrong.
+
+    Returns:
+        ``(olf_id, native_urn)`` — ``olf_id`` is always a non-empty OLF id when we
+        return; ``native_urn`` may be ``None`` if the document carried only an
+        AKN-path id and no NIR alias.
+    """
+    work = tree.find(
+        f".//{{{AKN_NS}}}identification/{{{AKN_NS}}}FRBRWork"
+    )
+
+    native_urn = _frbrwork_native_urn(work) or ref.native_urn
+
+    # Prefer the AKN naming-path (FRBRuri); fall back to the NIR URN.
+    olf_id: str | None = None
+    frbr_uri = None
+    if work is not None:
+        uri_el = work.find(f"{{{AKN_NS}}}FRBRuri")
+        frbr_uri = uri_el.get("value") if uri_el is not None else None
+    if frbr_uri:
+        olf_id = urnlib.akn_uri_to_olf_id(frbr_uri)
+    if olf_id is None and native_urn:
+        try:
+            olf_id = urnlib.to_olf_id(native_urn)
+        except ValueError:
+            olf_id = None
+
+    # Defensive fallback to whatever the ref already carried.
+    if olf_id is None:
+        olf_id = ref.olf_id
+
+    if not olf_id:
+        raise ConformanceError(
+            "identity: could not derive an OLF id from the document's <FRBRWork> "
+            f"(FRBRuri={frbr_uri!r}, urn:nir={native_urn!r}). The act's canonical "
+            "type is unmapped or its self-id is absent — fix the vocabulary in "
+            "urn.py rather than guessing."
+        )
+    return olf_id, native_urn
+
+
+def _frbrwork_native_urn(work: etree._Element | None) -> str | None:
+    """Read the canonical NIR URN out of ``<FRBRWork>``.
+
+    Prefers ``FRBRalias[@name='urn:nir']``; otherwise returns the first
+    ``FRBRalias`` whose value starts ``urn:nir:``. Returns ``None`` if neither
+    exists (or ``work`` is ``None``).
+    """
+    if work is None:
+        return None
+    fallback: str | None = None
+    for alias in work.findall(f"{{{AKN_NS}}}FRBRalias"):
+        value = alias.get("value")
+        if not value:
+            continue
+        if alias.get("name") == "urn:nir":
+            return value
+        if fallback is None and value.startswith("urn:nir:"):
+            fallback = value
+    return fallback
 
 
 # --- helpers ---------------------------------------------------------

@@ -50,6 +50,19 @@ def archive_path(archive_root: Path, olf_id: str) -> Path:
     return archive_root / (body + ".akn.xml")
 
 
+def _ref_label(ref: ActRef) -> str:
+    """A log-friendly label for an ActRef whose canonical olf_id may not yet be
+    derived (it is filled in from the AKN during transform). Falls back to the
+    source coordinates that uniquely identify the act before transform."""
+    if ref.olf_id:
+        return ref.olf_id
+    parts = [p for p in (ref.denominazione, ref.anno, ref.numero) if p]
+    label = " ".join(parts) if parts else "<unknown act>"
+    if ref.codice_redazionale:
+        label += f" [{ref.codice_redazionale}]"
+    return label
+
+
 def _chunked(iterable: Iterable[_T], n: int) -> Iterator[list[_T]]:
     """Yield successive non-overlapping lists of up to *n* items from *iterable*
     without materialising the whole iterable up-front."""
@@ -134,11 +147,11 @@ def run(
             doc = adapter.transform(source_doc)
         except ConformanceError as e:
             errors += 1
-            print(f"  SKIP {source_doc.ref.olf_id}: conformance: {e}", file=sys.stderr)
+            print(f"  SKIP {_ref_label(source_doc.ref)}: conformance: {e}", file=sys.stderr)
             return
         except Exception as e:  # noqa: BLE001 - one bad act must not kill the run
             errors += 1
-            print(f"  FAIL {source_doc.ref.olf_id}: {e}", file=sys.stderr)
+            print(f"  FAIL {_ref_label(source_doc.ref)}: {e}", file=sys.stderr)
             return
         out = archive_path(archive_root, doc.ref.olf_id)
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -162,7 +175,7 @@ def run(
                     source_doc = adapter.fetch(ref)
                 except Exception as e:  # noqa: BLE001
                     errors += 1
-                    print(f"  FAIL {ref.olf_id}: fetch: {e}", file=sys.stderr)
+                    print(f"  FAIL {_ref_label(ref)}: fetch: {e}", file=sys.stderr)
                     continue
                 _write_doc(source_doc)
 

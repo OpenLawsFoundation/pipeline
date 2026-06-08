@@ -13,22 +13,23 @@ jurisdiction; the URN is what resolves against Normattiva.
 NOTE: this is the AKN4OLF identity normalization in practice — we normalize the
 *name*, never the content.
 
-Design notes on the act-type vocabulary
-----------------------------------------
-``_DENOMINAZIONE_TO_NIR`` and ``_TYPE_MAP`` are the single source of truth for
-the Italian act-type vocabulary.  Both maps are intentionally extensible: add a
-new row to each when a previously-unseen denominazione appears in the corpus.
+Identity is CANONICAL-FROM-AKN
+------------------------------
+Identity is derived from the fetched document, never inferred from a search label.
+The fetched Akoma Ntoso carries the act's own self-id in ``<FRBRWork>`` — both as a
+native NIR URN (``FRBRalias[@name="urn:nir"]``) and as an AKN naming-path
+(``FRBRuri``). The transform reads those and maps the *type slug* to OLF via the
+two maps below:
 
-The public helper :func:`denominazione_for_nir_slug` is the canonical reverse
-lookup (NIR slug → API denominazione); client code must use it instead of
-maintaining a private copy.  Any slug not present in the maps raises ``ValueError``
-— loud failure on purpose, so gaps are found quickly rather than silently
-corrupting act identities.
+* :func:`to_olf_id` — NIR URN type slug → OLF slug, via ``_TYPE_MAP``.
+* :func:`akn_uri_to_olf_id` — AKN-path type segment → OLF slug, via
+  ``_AKN_TYPE_TO_OLF``.
 
-When a denominazione is encountered at ingest time that is not yet in the map,
-the adapter skips that act with a warning to stderr.  That is an honest,
-safe degradation — NOT a silent drop — and the act can be re-ingested once the
-vocabulary is extended.
+Both maps are the single source of truth for the Italian act-type vocabulary and
+are intentionally extensible: add a row when a previously-unseen, document-sourced
+type appears. A gap is now a precise, data-driven gap (a real act type we have not
+mapped) rather than a guess from a display label, so it is caught loudly at the
+self-id step rather than silently corrupting identities.
 """
 
 from __future__ import annotations
@@ -37,7 +38,6 @@ import re
 from dataclasses import dataclass
 
 # NIR act type -> OLF type slug. Extend as new types appear in the corpus.
-# Each entry here must have a corresponding entry in _DENOMINAZIONE_TO_NIR.
 _TYPE_MAP: dict[str, str] = {
     "legge": "legge",
     "decreto.legge": "decreto-legge",
@@ -53,39 +53,6 @@ _TYPE_MAP: dict[str, str] = {
     "decreto.legislativo.luogotenenziale": "decreto-legislativo-luogotenenziale",
     "decreto.luogotenenziale": "decreto-luogotenenziale",
 }
-
-# Normattiva API denominazioneAtto -> NIR type slug.
-# Keys are the uppercase strings returned by the ricerca/aggiornati endpoint;
-# matching is case-insensitive with normalised internal whitespace.
-# Each entry here must have a corresponding entry in _TYPE_MAP.
-# NOTE: every NIR slug must appear at most ONCE as a value here — the inverse
-# map (_NIR_TO_DENOMINAZIONE, built below) must be a true bijection.
-_DENOMINAZIONE_TO_NIR: dict[str, str] = {
-    "LEGGE": "legge",
-    "DECRETO-LEGGE": "decreto.legge",
-    "DECRETO LEGISLATIVO": "decreto.legislativo",
-    "DECRETO DEL PRESIDENTE DELLA REPUBBLICA": "decreto.presidente.repubblica",
-    "DECRETO DEL PRESIDENTE DEL CONSIGLIO DEI MINISTRI": "decreto.presidente.consiglio.ministri",
-    "REGIO DECRETO": "regio.decreto",
-    "LEGGE COSTITUZIONALE": "legge.costituzionale",
-    "DECRETO MINISTERIALE": "decreto.ministeriale",
-    # Historical / transitional act types (confidence: high — standard NIR usage)
-    "REGIO DECRETO-LEGGE": "regio.decreto.legge",
-    "REGIO DECRETO LEGISLATIVO": "regio.decreto.legislativo",
-    "DECRETO LEGISLATIVO LUOGOTENENZIALE": "decreto.legislativo.luogotenenziale",
-    "DECRETO LUOGOTENENZIALE": "decreto.luogotenenziale",
-}
-
-# Inverse of _DENOMINAZIONE_TO_NIR: NIR slug -> canonical API denominazione.
-# Built once at module load; collisions (two denominazioni mapping to the same
-# slug) would silently drop one entry and are caught by the assertion below.
-_NIR_TO_DENOMINAZIONE: dict[str, str] = {
-    slug: denom for denom, slug in _DENOMINAZIONE_TO_NIR.items()
-}
-assert len(_NIR_TO_DENOMINAZIONE) == len(_DENOMINAZIONE_TO_NIR), (
-    "Collision in _DENOMINAZIONE_TO_NIR: two denominazioni share the same NIR slug. "
-    "Each NIR slug must map back to exactly one denominazione."
-)
 
 # AKN path type slug (as used in /akn/<jur>/act/<type>/...) -> OLF type slug.
 # AKN path types may be camelCase or hyphen-separated; we normalise to lowercase
@@ -177,62 +144,6 @@ def _fragment_to_eid(fragment: str) -> str:
         m = re.match(r"^([a-z]+)(\d+)$", part)
         out.append(f"{m[1]}_{m[2]}" if m else part)
     return "__".join(out)
-
-
-def denominazione_for_nir_slug(slug: str) -> str:
-    """Return the Normattiva API ``denominazioneAtto`` for a NIR type slug.
-
-    This is the public, canonical reverse lookup — the inverse of
-    ``_DENOMINAZIONE_TO_NIR``.  Client code must use this function instead of
-    maintaining a private copy of the reverse map.
-
-    Raises :class:`ValueError` for any slug not present in the vocabulary
-    (loud failure by design — unknown slugs must be added explicitly rather
-    than silently producing wrong API calls).
-    """
-    denom = _NIR_TO_DENOMINAZIONE.get(slug)
-    if denom is None:
-        raise ValueError(
-            f"No Normattiva denominazione mapped for NIR slug {slug!r}; "
-            f"add it to _DENOMINAZIONE_TO_NIR (and _TYPE_MAP) in urn.py"
-        )
-    return denom
-
-
-def build_nir_urn(
-    denominazione: str,
-    year: "str | int",
-    month: "str | int",
-    day: "str | int",
-    number: str,
-    authority: str = "stato",
-) -> str:
-    """Construct a NIR URN from Normattiva search-result fields.
-
-    Parameters match the fields returned by the ricerca/aggiornati API:
-    - denominazione: ``denominazioneAtto`` value, e.g. "DECRETO-LEGGE"
-    - year/month/day: ``annoProvvedimento`` / ``meseProvvedimento`` / ``giornoProvvedimento``
-    - number: ``numeroProvvedimento``
-    - authority: defaults to "stato"
-
-    Returns e.g. ``urn:nir:stato:decreto.legge:2024-03-02;19``.
-
-    The result is guaranteed to be parseable by :func:`parse` and convertible by
-    :func:`to_olf_id` for all denominations that are already in ``_TYPE_MAP``.
-
-    Raises :class:`ValueError` for unrecognised ``denominazione`` values (loud
-    failure by design — unknown types must be added explicitly).
-    """
-    # Normalise: uppercase, collapse internal whitespace.
-    key = " ".join(denominazione.upper().split())
-    nir_slug = _DENOMINAZIONE_TO_NIR.get(key)
-    if nir_slug is None:
-        raise ValueError(
-            f"Unrecognised denominazioneAtto {denominazione!r}; "
-            f"add it to _DENOMINAZIONE_TO_NIR"
-        )
-    date_str = f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
-    return f"urn:nir:{authority}:{nir_slug}:{date_str};{number}"
 
 
 def _akn_type_to_olf(akn_type: str) -> str | None:

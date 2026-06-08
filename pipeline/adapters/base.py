@@ -18,11 +18,29 @@ from typing import Iterator, Protocol
 
 @dataclass(frozen=True)
 class ActRef:
-    """A pointer to one act in the source system, before fetching."""
+    """A pointer to one act in the source system, before fetching.
 
-    olf_id: str          # e.g. "olf:it/legge/2019/123"
-    native_urn: str      # e.g. "urn:nir:stato:legge:2019-08-05;123"
+    Identity is CANONICAL-FROM-AKN: ``olf_id`` and ``native_urn`` are not known at
+    discovery time and are derived from the fetched Akoma Ntoso during transform
+    (the document carries its own self-id in ``<FRBRWork>``). At discovery we only
+    know the source *coordinates* needed to fetch the act and to match the right
+    entry inside the export ZIP — ``denominazione`` / ``anno`` / ``numero`` /
+    ``codice_redazionale`` / ``data_gu``. Discovery therefore yields an ActRef with
+    the coordinates set and ``olf_id``/``native_urn`` left ``None``; transform fills
+    in the derived canonical identity.
+    """
+
+    # Canonical identity — DERIVED from the AKN <FRBRWork> during transform, not
+    # known at discovery. Optional everywhere upstream of transform.
+    olf_id: str | None = None        # e.g. "olf:it/legge/2019/123"
+    native_urn: str | None = None    # e.g. "urn:nir:stato:legge:2019-08-05;123"
     source_modified: datetime | None = None  # last change seen at the source, if known
+    # Source coordinates used only to FETCH and to MATCH the right act/version.
+    denominazione: str | None = None      # search label, e.g. "DECRETO-LEGGE"
+    anno: str | None = None               # provvedimento year, e.g. "2024"
+    numero: str | None = None             # provvedimento number, e.g. "19"
+    codice_redazionale: str | None = None  # e.g. "24G00035" (embedded in ZIP names)
+    data_gu: str | None = None            # Gazzetta Ufficiale date, e.g. "2024-03-02"
 
 
 @dataclass
