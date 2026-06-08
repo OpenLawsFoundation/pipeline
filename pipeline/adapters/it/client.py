@@ -1,0 +1,539 @@
+"""Client for the Normattiva Open Data API (IPZS).
+
+Grounded in the live API (confirmed against captured responses):
+  base_url = "https://api.normattiva.it/t/normattiva.api/bff-opendata/v1"
+  suffix paths start "/api/v1/...". No authentication is required.
+
+The API exposes three capabilities this adapter uses:
+
+  1. INCREMENTAL DISCOVERY — ``POST /api/v1/ricerca/aggiornati`` returns every act
+     whose ``dataUltimaModifica`` falls in a date window (window must be <= 12
+     months, <= 7000 results). No URN field is returned; we *construct* the NIR
+     URN from the act's denomination + provvedimento date/number.
+
+  2. BACKFILL ENUMERATION — ``POST /api/v1/ricerca/semplice`` paginates the
+     corpus (same item shape as ``aggiornati``).
+
+  3. ACT AKN RETRIEVAL — an asynchronous export flow (the only way to get AKN):
+     ``ricerca-asincrona/nuova-ricerca`` (202 + token) ->
+     ``ricerca-asincrona/conferma-ricerca`` (PUT) ->
+     poll ``ricerca-asincrona/check-status/<token>`` until HTTP 303 carries the
+     download URL in the ``x-ipzs-location`` header -> GET that URL for a ZIP of
+     AKN XML.
+
+  4. URN RESOLVER (human): ``{urn_resolver}?{native_urn}``.
+
+The public interface the rest of the adapter depends on is unchanged:
+``NormattivaClient`` with ``search_modified_since``, ``fetch_akn`` and
+``resolver_url``. Construction is config-driven (config.py / config.yaml) and a
+``_throttle()`` rate limiter guards every network call.
+"""
+
+from __future__ import annotations
+
+import io
+import sys
+import time
+import zipfile
+from datetime import datetime, timedelta, timezone
+from typing import Iterator
+from xml.etree import ElementTree as ET
+
+import requests
+
+from ..base import ActRef
+from . import urn as urnlib
+from .config import load as load_config
+
+# Fallback constants (used only if config.yaml is absent). The live values come
+# from config.py / config.yaml.
+DEFAULT_BASE = "https://api.normattiva.it/t/normattiva.api/bff-opendata/v1"
+URN_RESOLVER = "https://www.normattiva.it/uri-res/N2Ls"
+
+# AKN media type per the Akoma Ntoso standard.
+AKN_MEDIA_TYPE = "application/akn+xml"
+
+# Async-export polling defaults. Exports can take minutes; these are sane,
+# good-citizen defaults overridable via config.yaml (source.export_poll_seconds /
+# source.export_max_wait_seconds). Multivigente toggles full version history.
+DEFAULT_EXPORT_POLL_SECONDS = 5.0
+DEFAULT_EXPORT_MAX_WAIT_SECONDS = 600.0
+DEFAULT_MULTIVIGENTE = True
+
+# The aggiornati window is capped server-side at 12 months (error 1501). We chunk
+# anything wider into successive <= 12-month windows. Use 360 days to stay safely
+# under the 12-month ceiling regardless of month lengths / leap years.
+_MAX_WINDOW_DAYS = 360
+
+# Backfill keyword: ricerca/semplice rejects an empty testoRicerca, so we use the
+# Italian definite article "la", which matches effectively the whole corpus while
+# being an accepted, non-empty term.
+_BACKFILL_KEYWORD = "la"
+
+# AKN namespace (for parsing FRBRalias urn:nir out of an export entry).
+_AKN_NS = "http://docs.oasis-open.org/legaldocml/ns/akn/3.0"
+
+
+class NormattivaError(RuntimeError):
+    """Raised for documented API error responses (server error codes, bad export
+    requests, failed exports). Carries the API error code when available."""
+
+    def __init__(self, message: str, code: int | None = None):
+        super().__init__(message)
+        self.code = code
+
+
+class NormattivaClient:
+    def __init__(
+        self,
+        base_url: str | None = None,
+        *,
+        timeout: float | None = None,
+        rate_limit_s: float | None = None,
+        page_size: int | None = None,
+        session: requests.Session | None = None,
+    ):
+        cfg = load_config().source
+        self.base_url = (base_url or cfg.base_url).rstrip("/")
+        self.timeout = timeout if timeout is not None else cfg.request_timeout_seconds
+        self.rate_limit_s = rate_limit_s if rate_limit_s is not None else cfg.rate_limit_seconds
+        self.page_size = page_size if page_size is not None else cfg.page_size
+        self.urn_resolver = cfg.urn_resolver
+        # Optional async-export knobs (added to config with defaults; older
+        # configs without them keep working via getattr fallbacks).
+        self.export_poll_s = getattr(cfg, "export_poll_seconds", DEFAULT_EXPORT_POLL_SECONDS)
+        self.export_max_wait_s = getattr(cfg, "export_max_wait_seconds", DEFAULT_EXPORT_MAX_WAIT_SECONDS)
+        self.multivigente = getattr(cfg, "multivigente", DEFAULT_MULTIVIGENTE)
+        self.session = session or requests.Session()
+        self.session.headers.update({"User-Agent": "openlawsfoundation-adapter-it"})
+        self._last_call = 0.0
+
+    def _throttle(self) -> None:
+        # Be a good citizen against a public institutional API.
+        wait = self.rate_limit_s - (time.monotonic() - self._last_call)
+        if wait > 0:
+            time.sleep(wait)
+        self._last_call = time.monotonic()
+
+    # --- discovery -------------------------------------------------------
+
+    def search_modified_since(self, since: datetime | None) -> Iterator[ActRef]:
+        """Enumerate acts changed since ``since`` (None = the whole corpus).
+
+        ``since`` is a datetime or None:
+
+        * not None -> INCREMENTAL via ``ricerca/aggiornati`` over the window
+          ``[since, now]`` in UTC. The server caps the window at 12 months, so a
+          wider span is chunked into successive <= 12-month windows, each queried
+          in turn. Documented server error codes are surfaced as
+          :class:`NormattivaError` (notably 1502 "too many results", a real
+          signal that the caller should narrow the window).
+        * None -> BACKFILL via ``ricerca/semplice``, paginating the corpus until
+          ``paginaCorrente >= numeroPagine``.
+
+        For each act we *construct* the NIR URN from its denomination + date +
+        number (the API returns no URN). An item whose denomination is not in the
+        type map is skipped with a warning to stderr — one unknown type must not
+        abort the whole run.
+
+        NOTE: a full-corpus AKN export (per-act async export) is heavy; this
+        method only enumerates ``ActRef``s. Bulk AKN export optimisation is out
+        of scope here.
+        """
+        if since is None:
+            yield from self._backfill()
+        else:
+            yield from self._incremental(since)
+
+    def _incremental(self, since: datetime) -> Iterator[ActRef]:
+        now = datetime.now(timezone.utc)
+        since = _as_utc(since)
+        # Chunk [since, now] into successive <= 12-month windows.
+        window_start = since
+        while window_start < now:
+            window_end = min(window_start + timedelta(days=_MAX_WINDOW_DAYS), now)
+            self._throttle()
+            body = {
+                "dataInizioAggiornamento": _iso_z(window_start),
+                "dataFineAggiornamento": _iso_z(window_end),
+            }
+            r = self.session.post(
+                f"{self.base_url}/api/v1/ricerca/aggiornati",
+                json=body,
+                timeout=self.timeout,
+            )
+            r.raise_for_status()
+            data = r.json()
+            _raise_for_api_error(data)
+            for ref in self._items_to_refs(data.get("listaAtti", [])):
+                yield ref
+            # Advance to the next window (no overlap; windows are inclusive of
+            # their own end, successive windows pick up from there).
+            window_start = window_end + timedelta(days=1)
+
+    def _backfill(self) -> Iterator[ActRef]:
+        page = 1
+        while True:
+            self._throttle()
+            body = {
+                "testoRicerca": _BACKFILL_KEYWORD,
+                "orderType": "recente",
+                "paginazione": {
+                    "paginaCorrente": page,
+                    "numeroElementiPerPagina": self.page_size,
+                },
+            }
+            r = self.session.post(
+                f"{self.base_url}/api/v1/ricerca/semplice",
+                json=body,
+                timeout=self.timeout,
+            )
+            r.raise_for_status()
+            data = r.json()
+            _raise_for_api_error(data)
+            items = data.get("listaAtti", [])
+            for ref in self._items_to_refs(items):
+                yield ref
+            total_pages = int(data.get("numeroPagine", 0) or 0)
+            current = int(data.get("paginaCorrente", page) or page)
+            if not items or current >= total_pages:
+                return
+            page = current + 1
+
+    def _items_to_refs(self, items: list[dict]) -> Iterator[ActRef]:
+        for it in items:
+            denom = it.get("denominazioneAtto")
+            try:
+                native_urn = urnlib.build_nir_urn(
+                    denom,
+                    it.get("annoProvvedimento"),
+                    it.get("meseProvvedimento"),
+                    it.get("giornoProvvedimento"),
+                    str(it.get("numeroProvvedimento")),
+                )
+                olf_id = urnlib.to_olf_id(native_urn)
+            except ValueError as exc:
+                print(
+                    f"[normattiva] skipping act with unmapped denomination "
+                    f"{denom!r}: {exc}",
+                    file=sys.stderr,
+                )
+                continue
+            yield ActRef(
+                olf_id=olf_id,
+                native_urn=native_urn,
+                source_modified=_parse_dt(it.get("dataUltimaModifica")),
+            )
+
+    # --- fetch -----------------------------------------------------------
+
+    def fetch_akn(self, ref: ActRef) -> tuple[bytes, str]:
+        """Return ``(akn_bytes, source_url)`` for one act via the async export.
+
+        The native URN is decomposed (``urn.parse``) into act type / year /
+        number, the NIR type slug is mapped back to the API's ``denominazioneAtto``
+        and fed into the four-step asynchronous export:
+
+          1. POST ``ricerca-asincrona/nuova-ricerca`` -> 202 + token (UUID text).
+          2. PUT ``ricerca-asincrona/conferma-ricerca`` ``{"token": ...}``.
+          3. Poll GET ``ricerca-asincrona/check-status/<token>`` until HTTP 303;
+             the download URL is in the ``x-ipzs-location`` response header.
+          4. GET the download URL -> a ZIP of AKN XML; the entry whose
+             ``FRBRalias`` urn:nir equals ``ref.native_urn`` is returned (else the
+             first ``.xml`` entry).
+
+        ``source_url`` is the ``x-ipzs-location`` download URL (provenance).
+
+        Delegates to the small reusable helpers ``_submit_export``,
+        ``_check_export``, and ``_download_akn`` so the single-act and batch
+        paths share one implementation of each step.
+        """
+        token = self._submit_export(ref)
+        # Poll until done or deadline.
+        deadline = time.monotonic() + self.export_max_wait_s
+        url: str | None = None
+        while url is None:
+            self._throttle()
+            url = self._check_export(token)
+            if url is None:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"Normattiva export {token} did not complete within "
+                        f"{self.export_max_wait_s}s"
+                    )
+                self._wait_poll_interval(deadline)
+        akn_bytes, source_url = self._download_akn_url(url, ref)
+        return akn_bytes, source_url
+
+    def export_batch(
+        self, refs: list[ActRef]
+    ) -> Iterator[tuple[ActRef, bytes, str]]:
+        """Submit all export jobs up-front, then collect results as they finish.
+
+        Because each async AKN export can take minutes on the server side,
+        submitting all jobs before polling means wall-time ≈ slowest single job
+        rather than O(N × per-job time).  This method is single-threaded;
+        concurrency is entirely server-side.
+
+        Phase 1 — submit all:
+            For each ref call ``_submit_export`` (throttled).  If a ref raises
+            ``NormattivaError`` (e.g. unmapped denomination slug), log a warning
+            to stderr and skip it.  All other refs are added to ``pending``.
+
+        Phase 2 — collect:
+            Loop until ``pending`` is empty or ``export_max_wait_seconds`` elapses
+            (measured with ``time.monotonic``).  Each round, throttle-check every
+            pending token; when ``_check_export`` returns a URL, download and
+            yield ``(ref, bytes, source_url)``, then remove from pending.  After
+            a full round with nothing newly ready, sleep ``export_poll_seconds``.
+
+        Timed-out refs are logged to stderr.  They are NOT silently dropped:
+        the caller will re-encounter them on the next incremental run via the
+        overlap window, so this is an honest, recoverable skip.
+        """
+        # --- Phase 1: submit all ------------------------------------------
+        pending: dict[str, ActRef] = {}  # token -> ref
+        for ref in refs:
+            try:
+                token = self._submit_export(ref)
+            except (NormattivaError, ValueError) as exc:
+                print(
+                    f"[normattiva] batch: skipping {ref.olf_id!r} (submit failed): {exc}",
+                    file=sys.stderr,
+                )
+                continue
+            pending[token] = ref
+
+        if not pending:
+            return
+
+        # --- Phase 2: collect until all done or deadline -------------------
+        deadline = time.monotonic() + self.export_max_wait_s
+        while pending:
+            if time.monotonic() >= deadline:
+                break
+            newly_ready = 0
+            for token, ref in list(pending.items()):
+                self._throttle()
+                url = self._check_export(token)
+                if url is not None:
+                    akn_bytes, source_url = self._download_akn_url(url, ref)
+                    del pending[token]
+                    newly_ready += 1
+                    yield (ref, akn_bytes, source_url)
+            if pending and newly_ready == 0:
+                # Nothing became ready this round; sleep before the next sweep.
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    time.sleep(min(self.export_poll_s, remaining))
+
+        # Any tokens still pending hit the deadline.
+        if pending:
+            timed_out = [ref.olf_id for ref in pending.values()]
+            print(
+                f"[normattiva] batch: export deadline reached; "
+                f"{len(timed_out)} ref(s) timed out and will be retried on the "
+                f"next incremental run: {timed_out}",
+                file=sys.stderr,
+            )
+
+    # --- internal helpers (shared by fetch_akn and export_batch) ----------
+
+    def _submit_export(self, ref: ActRef) -> str:
+        """Submit the two-step nuova-ricerca + conferma-ricerca for one ref.
+
+        Returns the server-issued export token (UUID string).  Raises
+        ``NormattivaError`` if the denomination slug cannot be mapped or the
+        API returns an error response.
+        """
+        p = urnlib.parse(ref.native_urn)
+        try:
+            denominazione = urnlib.denominazione_for_nir_slug(p.act_type)
+        except ValueError as exc:
+            raise NormattivaError(str(exc)) from exc
+        token = self._export_new_search(denominazione, p.year, p.number)
+        self._export_confirm(token)
+        return token
+
+    def _check_export(self, token: str) -> str | None:
+        """One check-status call for ``token``.
+
+        Returns the ``x-ipzs-location`` download URL when HTTP 303 (done), or
+        ``None`` when the export is still processing (409 / 200 / 202).  Any
+        other status raises via ``raise_for_status``.
+        """
+        url = f"{self.base_url}/api/v1/ricerca-asincrona/check-status/{token}"
+        r = self.session.get(url, allow_redirects=False, timeout=self.timeout)
+        if r.status_code == 303:
+            location = r.headers.get("x-ipzs-location")
+            if not location:
+                raise NormattivaError(
+                    "check-status returned 303 without an x-ipzs-location header"
+                )
+            return location
+        if r.status_code in (200, 202, 409):
+            return None  # still processing
+        r.raise_for_status()
+        raise NormattivaError(
+            f"Unexpected check-status response {r.status_code} for {token}"
+        )
+
+    def _download_akn_url(self, download_url: str, ref: ActRef) -> tuple[bytes, str]:
+        """GET the ZIP at ``download_url``, extract and return ``(bytes, url)``.
+
+        The entry whose ``FRBRalias`` urn:nir equals ``ref.native_urn`` is
+        preferred; otherwise the first ``.xml`` entry is returned.
+        """
+        self._throttle()
+        r = self.session.get(download_url, timeout=self.timeout)
+        r.raise_for_status()
+        akn_bytes = _extract_akn_from_zip(r.content, ref.native_urn)
+        return akn_bytes, download_url
+
+    def _export_new_search(self, denominazione: str, year: int, number: str) -> str:
+        self._throttle()
+        body = {
+            "formato": "AKN",
+            "tipoRicerca": "A",
+            "parametriRicerca": {
+                "denominazioneAtto": denominazione,
+                "annoProvvedimento": f"{year:04d}",
+                "numeroProvvedimento": str(number),
+                "orderType": "recente",
+                "paginazione": {
+                    "paginaCorrente": 1,
+                    "numeroElementiPerPagina": 10,
+                },
+            },
+        }
+        if self.multivigente:
+            body["multivigente"] = True
+        r = self.session.post(
+            f"{self.base_url}/api/v1/ricerca-asincrona/nuova-ricerca",
+            json=body,
+            timeout=self.timeout,
+        )
+        r.raise_for_status()
+        text = r.text.strip()
+        # A JSON body here means an error (e.g. {"code": 1003}); a bare UUID string
+        # is the happy path.
+        if text.startswith("{"):
+            try:
+                data = r.json()
+            except ValueError:
+                data = {}
+            _raise_for_api_error(data)
+            raise NormattivaError(f"Unexpected JSON from nuova-ricerca: {text!r}")
+        if not text:
+            raise NormattivaError("Empty token from nuova-ricerca")
+        return text.strip('"')
+
+    def _export_confirm(self, token: str) -> None:
+        self._throttle()
+        r = self.session.put(
+            f"{self.base_url}/api/v1/ricerca-asincrona/conferma-ricerca",
+            json={"token": token},
+            timeout=self.timeout,
+        )
+        r.raise_for_status()
+        try:
+            data = r.json()
+        except ValueError:
+            data = {}
+        _raise_for_api_error(data)
+
+    def _wait_poll_interval(self, deadline: float) -> None:
+        """Sleep one poll interval, but never past the overall deadline."""
+        remaining = deadline - time.monotonic()
+        time.sleep(min(self.export_poll_s, max(0.0, remaining)))
+
+    def resolver_url(self, native_urn: str) -> str:
+        """Human-resolvable Normattiva URL for an act, for cross-checking."""
+        return f"{self.urn_resolver}?{native_urn}"
+
+
+# --- helpers -------------------------------------------------------------
+
+
+def _raise_for_api_error(data: object) -> None:
+    """Raise NormattivaError if a parsed response carries a documented error code.
+
+    The API signals errors with a JSON ``code`` field (1003 bad request, 1501
+    window too wide, 1502 too many results, 1503 end < start, ...). A 1502 is a
+    real signal — the caller is expected to narrow the query — so we surface it
+    rather than swallowing it.
+    """
+    if not isinstance(data, dict):
+        return
+    code = data.get("code")
+    if code is None:
+        return
+    try:
+        code_int = int(code)
+    except (TypeError, ValueError):
+        code_int = None
+    message = data.get("message") or data.get("descrizione") or str(data)
+    raise NormattivaError(f"Normattiva API error {code}: {message}", code=code_int)
+
+
+def _extract_akn_from_zip(content: bytes, native_urn: str) -> bytes:
+    """Pull the AKN XML for ``native_urn`` out of an export ZIP.
+
+    Entries look like ``DECRETO-LEGGE_20240302_19/..._ORIGINALE_V0.xml``. When
+    several .xml entries are present we pick the one whose AKN ``FRBRalias``
+    urn:nir equals ``native_urn``; otherwise the first .xml entry.
+    """
+    with zipfile.ZipFile(io.BytesIO(content)) as zf:
+        xml_names = [n for n in zf.namelist() if n.lower().endswith(".xml")]
+        if not xml_names:
+            raise NormattivaError("Export ZIP contains no .xml entry")
+        if len(xml_names) == 1:
+            return zf.read(xml_names[0])
+        first_bytes: bytes | None = None
+        for name in xml_names:
+            raw = zf.read(name)
+            if first_bytes is None:
+                first_bytes = raw
+            if _akn_urn(raw) == native_urn:
+                return raw
+        # No exact URN match — fall back to the first .xml entry.
+        return first_bytes if first_bytes is not None else zf.read(xml_names[0])
+
+
+def _akn_urn(raw: bytes) -> str | None:
+    """Return the FRBRalias urn:nir value from an AKN document, or None."""
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError:
+        return None
+    for alias in root.iter(f"{{{_AKN_NS}}}FRBRalias"):
+        if alias.get("name") == "urn:nir":
+            value = alias.get("value")
+            if value:
+                return value
+    return None
+
+
+def _as_utc(dt: datetime) -> datetime:
+    """Coerce a datetime to UTC (treat naive datetimes as already-UTC)."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _iso_z(dt: datetime) -> str:
+    """Format a UTC datetime as ISO8601 with milliseconds and a 'Z' suffix.
+
+    e.g. ``2024-04-27T00:00:00.000Z`` (the shape the API expects).
+    """
+    dt = _as_utc(dt)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+
+
+def _parse_dt(value) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None

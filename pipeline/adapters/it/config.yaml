@@ -1,0 +1,53 @@
+# Operational configuration for the Italy (Normattiva) adapter.
+#
+# Declarative knobs ONLY. This file must never contain:
+#   - secrets / tokens          -> GitHub Actions secrets (ARCHIVE_WRITE_TOKEN)
+#   - the NIR->OLF type mapping  -> lives in urn.py (_TYPE_MAP), it is tested logic
+#
+# Rule of thumb: if it's a knob you'd tune without changing behavior, it goes
+# here. If it's a rule that could be wrong, it goes in code where tests catch it.
+
+# NOTE: adapter name + version are NOT here on purpose. They are part of the
+# provenance stamped into every document, i.e. logic, not configuration, so they
+# live in adapter.py as the single source of truth (ItalyAdapter.name/version).
+
+source:
+  # Production BFF base. The spec also documents a pre-production host
+  # (pre.api.normattiva.it) — switch here for testing without touching code.
+  base_url: "https://api.normattiva.it/t/normattiva.api/bff-opendata/v1"
+  urn_resolver: "https://www.normattiva.it/uri-res/N2Ls"
+  # Be a good citizen against a public institutional API.
+  rate_limit_seconds: 1.0
+  request_timeout_seconds: 30
+  page_size: 200
+  # Async AKN export (ricerca-asincrona) polling. Exports can take minutes; we
+  # poll check-status every export_poll_seconds up to export_max_wait_seconds.
+  export_poll_seconds: 5.0
+  export_max_wait_seconds: 600.0
+  # Request the full multi-version (multivigente) AKN so the temporal history is
+  # inside the document.
+  multivigente: true
+
+incremental:
+  # Overlap window subtracted from "last run" when computing `since`.
+  # Normattiva applies amendments to modified acts within ~3 days, so we re-scan
+  # a few days back each run. transform() is idempotent, so re-seeing an
+  # unchanged act yields an identical file and no diff.
+  overlap_days: 2
+
+output:
+  # Path template under the archive repo, relative to its root.
+  # Filled from the OLF id: olf:it/legge/2019/123 -> it/legge/2019/123.akn.xml
+  layout: "{jurisdiction}/{type}/{year}/{number}.akn.xml"
+  encoding: "UTF-8"
+
+diff:
+  # Change classes the semantic-diff gate is allowed to DROP before opening a PR
+  # (so they never become commits). Everything else is a real change.
+  drop_change_classes:
+    - cosmetic       # whitespace / punctuation / re-render only
+  # Change classes that must always produce a commit, even if small.
+  always_commit_classes:
+    - text_amended
+    - vigenza_changed
+    - reference_changed

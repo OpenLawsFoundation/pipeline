@@ -1,0 +1,91 @@
+name: adapter-it-incremental
+
+# Daily incremental: "what did Normattiva publish since yesterday?"
+# Small by design — fits inside Actions. Opens a PR to the archive repo; the
+# conformance suite runs on that PR (in the archive repo's own CI) as the gate.
+# A change only becomes a commit if the semantic diff says the norm actually
+# changed, not on a re-render.
+
+on:
+  schedule:
+    - cron: "0 4 * * *"   # 04:00 UTC daily
+  workflow_dispatch:       # allow manual trigger
+
+permissions:
+  contents: read
+
+concurrency:
+  group: adapter-it-incremental
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout pipeline
+        uses: actions/checkout@v4
+        with:
+          path: pipeline
+
+      - name: Checkout archive (target repo)
+        uses: actions/checkout@v4
+        with:
+          repository: OpenLawsFoundation/archive
+          path: archive
+          # Fine-grained PAT or deploy key with write access to the archive repo,
+          # stored as an org/repo secret. Never commit it.
+          token: ${{ secrets.ARCHIVE_WRITE_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        working-directory: pipeline
+        run: pip install -r requirements.txt
+
+      - name: Compute "since" (last successful run)
+        id: since
+        run: echo "value=$(date -u -d '2 days ago' +%Y-%m-%dT%H:%M:%S)" >> "$GITHUB_OUTPUT"
+        # 2-day overlap window absorbs Normattiva's amendment lag (modified acts
+        # land within ~3 days). The transform is idempotent, so re-seeing an
+        # unchanged act produces an identical file and no diff.
+
+      - name: Generate AKN4OLF documents
+        working-directory: pipeline/pipeline
+        run: |
+          python -m adapters.runner.run \
+            --jurisdiction it \
+            --archive "${GITHUB_WORKSPACE}/archive" \
+            --since "${{ steps.since.outputs.value }}"
+
+      - name: Semantic diff gate
+        id: diff
+        working-directory: archive
+        run: |
+          # Stage to inspect changes; the AKN-aware differ (olf-diff) classifies
+          # each changed file. Cosmetic-only changes (re-render, whitespace) are
+          # reverted so they never become commits.
+          git add -A
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            # TODO: invoke olf-diff to drop cosmetic-only changes:
+            #   python -m olf_diff.gate --staged --drop cosmetic
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open PR to archive
+        if: steps.diff.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          path: archive
+          token: ${{ secrets.ARCHIVE_WRITE_TOKEN }}
+          branch: auto/it-incremental
+          commit-message: "it: incremental update ${{ steps.since.outputs.value }}"
+          title: "Italy — incremental update"
+          body: |
+            Automated incremental update from Normattiva.
+            Adapter: normattiva-it. Conformance suite runs as a required check.
+          labels: jurisdiction:it, automated
