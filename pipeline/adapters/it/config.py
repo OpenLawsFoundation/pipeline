@@ -31,6 +31,9 @@ class SourceConfig:
     export_poll_seconds: float = 5.0
     export_max_wait_seconds: float = 600.0
     multivigente: bool = True
+    # Earliest year to enumerate in backfill mode (year of Italian unification).
+    # Override via config.yaml ``source.backfill_start_year``.
+    backfill_start_year: int = 1861
 
 
 @dataclass(frozen=True)
@@ -83,6 +86,7 @@ def load(path: Path | None = None) -> Config:
             export_poll_seconds=float(src.get("export_poll_seconds", SourceConfig.export_poll_seconds)),
             export_max_wait_seconds=float(src.get("export_max_wait_seconds", SourceConfig.export_max_wait_seconds)),
             multivigente=bool(src.get("multivigente", SourceConfig.multivigente)),
+            backfill_start_year=int(src.get("backfill_start_year", SourceConfig.backfill_start_year)),
         ),
         incremental=IncrementalConfig(
             overlap_days=int(inc.get("overlap_days", IncrementalConfig.overlap_days)),
