@@ -406,8 +406,7 @@ class NormattivaClient:
                 },
             },
         }
-        if self.multivigente:
-            body["multivigente"] = True
+        body["richiestaExport"] = "M" if self.multivigente else "O"
         r = self.session.post(
             f"{self.base_url}/api/v1/ricerca-asincrona/nuova-ricerca",
             json=body,
@@ -477,18 +476,76 @@ def _raise_for_api_error(data: object) -> None:
 
 
 def _extract_akn_from_zip(content: bytes, native_urn: str) -> bytes:
-    """Pull the AKN XML for ``native_urn`` out of an export ZIP.
+    """Pull the current consolidated AKN XML out of a Normattiva export ZIP.
 
-    Entries look like ``DECRETO-LEGGE_20240302_19/..._ORIGINALE_V0.xml``. When
-    several .xml entries are present we pick the one whose AKN ``FRBRalias``
-    urn:nir equals ``native_urn``; otherwise the first .xml entry.
+    Normattiva ships ``richiestaExport:"M"`` (multivigente) results as a ZIP of
+    SEPARATE per-version files, one per consolidation point, e.g.:
+
+        DECRETO-LEGGE_20060403_152/..._ORIGINALE_V0.xml
+        DECRETO-LEGGE_20060403_152/..._VIGENZA_2006-07-13_V1.xml
+        DECRETO-LEGGE_20060403_152/..._VIGENZA_2021-06-01_V141.xml
+        ...
+
+    We archive the CURRENT consolidated version — the latest VIGENZA entry whose
+    date is not in the future (≤ today UTC).  That file itself carries the full
+    amendment history in its ``<lifecycle>``/``<analysis>`` blocks, so
+    downstream transforms see all amendment events without needing to reassemble
+    all versions.  Assembling every version into one temporal AKN document is a
+    separate future concern and out of scope here.
+
+    Selection algorithm:
+      1. Parse each ``_VIGENZA_<YYYY-MM-DD>_V<n>`` entry; collect (date, n, name).
+      2. Keep only those with date ≤ today UTC.
+      3. Pick the one with the latest date; tie-break on highest V<n>.
+      4. If no VIGENZA entries pass the filter (un-amended act — only ORIGINALE),
+         use the ORIGINALE_V0 entry.
+      5. If filenames don't match either pattern at all, fall back to
+         FRBRalias-match then first-xml (legacy safety net).
     """
+    import re
+
+    today = datetime.now(timezone.utc).date()
+
     with zipfile.ZipFile(io.BytesIO(content)) as zf:
         xml_names = [n for n in zf.namelist() if n.lower().endswith(".xml")]
         if not xml_names:
             raise NormattivaError("Export ZIP contains no .xml entry")
         if len(xml_names) == 1:
             return zf.read(xml_names[0])
+
+        # --- parse filename tokens -------------------------------------------
+        _pat_vigenza = re.compile(r"_VIGENZA_(\d{4}-\d{2}-\d{2})_V(\d+)\.xml$", re.IGNORECASE)
+        _pat_originale = re.compile(r"_ORIGINALE_V(\d+)\.xml$", re.IGNORECASE)
+
+        vigenza_entries: list[tuple[object, int, str]] = []  # (date, n, name)
+        originale_name: str | None = None
+
+        for name in xml_names:
+            m = _pat_vigenza.search(name)
+            if m:
+                try:
+                    from datetime import date as _date
+                    entry_date = _date.fromisoformat(m.group(1))
+                    entry_n = int(m.group(2))
+                    vigenza_entries.append((entry_date, entry_n, name))
+                except ValueError:
+                    pass
+                continue
+            if _pat_originale.search(name) and originale_name is None:
+                originale_name = name
+
+        # --- select best VIGENZA ≤ today -------------------------------------
+        valid_vigenza = [(d, n, nm) for (d, n, nm) in vigenza_entries if d <= today]
+        if valid_vigenza:
+            # latest date first, then highest V<n>
+            valid_vigenza.sort(key=lambda t: (t[0], t[1]), reverse=True)
+            return zf.read(valid_vigenza[0][2])
+
+        # --- no valid VIGENZA: use ORIGINALE if found ------------------------
+        if originale_name is not None:
+            return zf.read(originale_name)
+
+        # --- legacy fallback: FRBRalias-match then first-xml -----------------
         first_bytes: bytes | None = None
         for name in xml_names:
             raw = zf.read(name)
@@ -496,7 +553,6 @@ def _extract_akn_from_zip(content: bytes, native_urn: str) -> bytes:
                 first_bytes = raw
             if _akn_urn(raw) == native_urn:
                 return raw
-        # No exact URN match — fall back to the first .xml entry.
         return first_bytes if first_bytes is not None else zf.read(xml_names[0])
 
 

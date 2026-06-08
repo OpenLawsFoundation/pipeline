@@ -15,6 +15,7 @@ Everything else in the document is passed through untouched.
 from __future__ import annotations
 
 import hashlib
+import re
 from datetime import date, datetime, timezone
 
 from lxml import etree
@@ -33,6 +34,11 @@ def build(doc: SourceDocument, *, adapter_name: str, adapter_version: str) -> OL
     except etree.XMLSyntaxError as e:
         raise ConformanceError(f"Source is not well-formed XML: {e}") from e
 
+    # 0. declare OLF as an agent so our <proprietary source="#openlawsfoundation">
+    #    resolves to a real, schema-declared <TLCOrganization>. Find-or-create,
+    #    idempotent across re-runs.
+    _ensure_olf_agent_declared(tree)
+
     # 1. identity ------------------------------------------------------
     olf_id = doc.ref.olf_id
     _set_olf_meta(tree, "identity", {
@@ -43,12 +49,14 @@ def build(doc: SourceDocument, *, adapter_name: str, adapter_version: str) -> OL
 
     # 2. lifecycle events ---------------------------------------------
     # Normattiva carries multivigenza in native AKN temporal elements; we read
-    # them and re-express the validity interval in the normalized OLF vocab.
+    # them and re-express the validity interval in the normalized OLF vocab,
+    # plus the named lifecycle events we can DERIVE (never fabricate).
     in_force_from, in_force_to = _extract_validity(tree)
-    _set_olf_meta(tree, "lifecycle", {
-        "inForceFrom": in_force_from.isoformat() if in_force_from else "",
-        "inForceTo": in_force_to.isoformat() if in_force_to else "",
-    })
+    lifecycle_fields = {"inForceFrom": in_force_from.isoformat() if in_force_from else None}
+    if in_force_to is not None:
+        lifecycle_fields["inForceTo"] = in_force_to.isoformat()
+    _set_olf_meta(tree, "lifecycle", lifecycle_fields)
+    _set_lifecycle_events(tree, in_force_from, in_force_to)
 
     # 3. references ----------------------------------------------------
     refs = _normalize_refs(tree)
@@ -69,6 +77,12 @@ def build(doc: SourceDocument, *, adapter_name: str, adapter_version: str) -> OL
     })
 
     akn_xml = etree.tostring(tree, xml_declaration=True, encoding="UTF-8")
+
+    # 5. conformance gate ---------------------------------------------
+    # Honor base.py's transform contract: a document that would fail the
+    # AKN4OLF suite must never reach the archive.
+    _assert_conformant(akn_xml, olf_id)
+
     return OLFDocument(
         ref=doc.ref,
         akn_xml=akn_xml,
@@ -82,6 +96,49 @@ def build(doc: SourceDocument, *, adapter_name: str, adapter_version: str) -> OL
 # --- helpers ---------------------------------------------------------
 
 OLF_PROPRIETARY_SOURCE = "#openlawsfoundation"
+
+# The agent id our <proprietary source="#openlawsfoundation"> points at. The
+# leading "#" is the IDREF; the declared <TLCOrganization> carries the bare eId.
+OLF_AGENT_EID = "openlawsfoundation"
+OLF_AGENT_HREF = "https://openlawsfoundation.org/"
+OLF_AGENT_SHOW_AS = "Open Laws Foundation"
+
+
+def _ensure_olf_agent_declared(tree: etree._Element) -> None:
+    """Declare the OLF organization in ``<meta>/<references>`` (find-or-create).
+
+    Our ``<proprietary source="#openlawsfoundation">`` is an IDREF that must
+    resolve to a declared agent for the document to be schema-valid AKN. AKN puts
+    Top-Level-Class declarations under ``<meta>/<references>``; we ensure that
+    block exists and holds a single::
+
+        <TLCOrganization eId="openlawsfoundation"
+                         href="https://openlawsfoundation.org/"
+                         showAs="Open Laws Foundation"/>
+
+    Idempotent: re-runs neither duplicate the element nor the ``<references>``
+    block. Real Normattiva documents already ship a ``<references>`` element
+    (holding ``<original>``); we reuse it rather than create a second one.
+    """
+    meta = tree.find(f".//{{{AKN_NS}}}meta")
+    if meta is None:
+        raise ConformanceError("Document has no <akn:meta>; not valid AKN")
+
+    references = meta.find(f"{{{AKN_NS}}}references")
+    if references is None:
+        references = etree.SubElement(meta, f"{{{AKN_NS}}}references")
+
+    for org in references.findall(f"{{{AKN_NS}}}TLCOrganization"):
+        if org.get("eId") == OLF_AGENT_EID:
+            # Already declared — keep it canonical, do not duplicate.
+            org.set("href", OLF_AGENT_HREF)
+            org.set("showAs", OLF_AGENT_SHOW_AS)
+            return
+
+    org = etree.SubElement(references, f"{{{AKN_NS}}}TLCOrganization")
+    org.set("eId", OLF_AGENT_EID)
+    org.set("href", OLF_AGENT_HREF)
+    org.set("showAs", OLF_AGENT_SHOW_AS)
 
 
 def _olf_block(tree: etree._Element) -> etree._Element:
@@ -111,13 +168,22 @@ def _olf_block(tree: etree._Element) -> etree._Element:
     return olf
 
 
-def _set_olf_meta(tree: etree._Element, group: str, fields: dict[str, str]) -> None:
+def _set_olf_meta(tree: etree._Element, group: str, fields: dict[str, str | None]) -> None:
+    """Write an ``<olf:GROUP>`` element with the given attributes.
+
+    Attributes whose value is ``None`` or empty are NOT emitted (an empty string
+    is not a valid date/value); any such attribute already present from a prior
+    run is removed, so re-runs converge on the same clean output.
+    """
     olf = _olf_block(tree)
     el = olf.find(f"{{{OLF_NS}}}{group}")
     if el is None:
         el = etree.SubElement(olf, f"{{{OLF_NS}}}{group}")
     for k, v in fields.items():
-        el.set(k, v or "")
+        if v:
+            el.set(k, v)
+        elif k in el.attrib:
+            del el.attrib[k]
 
 
 def _extract_validity(tree: etree._Element) -> tuple[date | None, date | None]:
@@ -349,8 +415,270 @@ def _parse_date(value: str) -> date | None:
         return None
 
 
+# --- lifecycle events (named vocabulary) -----------------------------
+
+def _set_lifecycle_events(
+    tree: etree._Element,
+    in_force_from: date | None,
+    in_force_to: date | None,
+) -> None:
+    """Emit ``<olf:event type=".." date="YYYY-MM-DD"/>`` for derivable events.
+
+    We NEVER fabricate a date; an event is emitted only when its date is actually
+    present in the source. Derivation, per AKN4OLF vocabulary:
+
+      * ``enacted``   — the act emanation date. Source priority:
+        ``identification/FRBRWork/FRBRdate@date`` → the URN/FRBRalias date →
+        the earliest ``<lifecycle>/<eventRef>`` date (the generation event).
+      * ``published`` — the Gazzetta Ufficiale publication date:
+        ``<meta>/<publication>@date`` if present, else
+        ``identification/FRBRExpression/FRBRdate@date``.
+      * ``commenced`` — entry into force = the layered ``in_force_from`` already
+        computed by :func:`_extract_validity` (kept identical to
+        ``inForceFrom`` so the interval and the named event agree).
+      * ``amended``   — each distinct amendment date we can find: lifecycle
+        ``<eventRef>`` elements whose ``@type``/``@refersTo`` mark an amendment,
+        plus the ``@date`` of any ``<passiveModifications>`` modification.
+        Emitted de-duplicated and sorted, one ``<olf:event>`` per distinct date.
+      * ``repealed``  — emitted only when an end-of-validity (abrogation) date is
+        detectable, i.e. the derived ``in_force_to``; otherwise omitted.
+
+    Children are rebuilt on every call (cleared first) so re-runs are idempotent.
+    """
+    olf = _olf_block(tree)
+    lifecycle = olf.find(f"{{{OLF_NS}}}lifecycle")
+    if lifecycle is None:
+        lifecycle = etree.SubElement(olf, f"{{{OLF_NS}}}lifecycle")
+
+    # Idempotency: drop any events from a previous run before re-deriving.
+    for prev in lifecycle.findall(f"{{{OLF_NS}}}event"):
+        lifecycle.remove(prev)
+
+    def emit(event_type: str, d: date | None) -> None:
+        if d is None:
+            return
+        ev = etree.SubElement(lifecycle, f"{{{OLF_NS}}}event")
+        ev.set("type", event_type)
+        ev.set("date", d.isoformat())
+
+    emit("enacted", _derive_enacted(tree))
+    emit("published", _derive_published(tree))
+    emit("commenced", in_force_from)
+    for d in _derive_amended_dates(tree):
+        emit("amended", d)
+    emit("repealed", in_force_to)
+
+
+def _derive_enacted(tree: etree._Element) -> date | None:
+    """The act emanation date: FRBRWork/FRBRdate → URN date → first eventRef."""
+    work_date = tree.find(
+        f".//{{{AKN_NS}}}identification"
+        f"/{{{AKN_NS}}}FRBRWork"
+        f"/{{{AKN_NS}}}FRBRdate"
+    )
+    if work_date is not None:
+        d = _parse_date(work_date.get("date", ""))
+        if d is not None:
+            return d
+
+    # URN / FRBRalias date (urn:nir:...:YYYY-MM-DD;num).
+    for alias in tree.iter(f"{{{AKN_NS}}}FRBRalias"):
+        if alias.get("name") == "urn:nir":
+            d = _urn_date(alias.get("value", ""))
+            if d is not None:
+                return d
+
+    # Earliest lifecycle eventRef = the generation event.
+    dates = [
+        d
+        for lc in tree.iter(f"{{{AKN_NS}}}lifecycle")
+        for ev in lc.findall(f"{{{AKN_NS}}}eventRef")
+        if (d := _parse_date(ev.get("date", ""))) is not None
+    ]
+    return min(dates) if dates else None
+
+
+def _urn_date(urn: str) -> date | None:
+    """Pull the YYYY-MM-DD emanation date out of a NIR URN, tolerantly."""
+    m = re.search(r":(\d{4}-\d{2}-\d{2});", urn)
+    return _parse_date(m.group(1)) if m else None
+
+
+def _derive_published(tree: etree._Element) -> date | None:
+    """The Gazzetta Ufficiale publication date: <publication>@date else FRBRExpr."""
+    pub = tree.find(f".//{{{AKN_NS}}}meta/{{{AKN_NS}}}publication")
+    if pub is not None:
+        d = _parse_date(pub.get("date", ""))
+        if d is not None:
+            return d
+    return _validity_from_frbr_expression(tree)
+
+
+# Event-type/refersTo stems (lowercased) that mark an AMENDMENT lifecycle event.
+_AMEND_STEMS = ("amend", "modif", "novell", "aggiorn")
+
+
+def _passiveref_eids(tree: etree._Element) -> set[str]:
+    """Collect eId values of ``<passiveRef>`` elements in ``<meta>/<references>``.
+
+    In real Normattiva consolidated documents (multivigente export), lifecycle
+    ``<eventRef>`` elements carry no ``@type``/``@refersTo`` — their only
+    discriminator is the ``@source`` attribute, which is an IDREF into
+    ``<meta>/<references>``.  A source that resolves to a ``<passiveRef>``
+    (another act that modified this one) is by definition an amendment event.
+    The original act's own enactment is represented by ``<original>``.
+    """
+    eids: set[str] = set()
+    for meta in tree.iter(f"{{{AKN_NS}}}meta"):
+        for refs in meta.findall(f"{{{AKN_NS}}}references"):
+            for pr in refs.findall(f"{{{AKN_NS}}}passiveRef"):
+                eid = pr.get("eId")
+                if eid:
+                    eids.add(eid)
+    return eids
+
+
+def _derive_amended_dates(tree: etree._Element) -> list[date]:
+    """Distinct, sorted amendment dates derivable from the source.
+
+    Three sources, unioned and de-duplicated:
+
+      a. lifecycle ``<eventRef>`` whose ``@type``/``@refersTo`` (lowercased)
+         names an amendment (EN *amend*/*modif*, IT *modif*/*novell*/*aggiorn*).
+         This covers the idealized AKN / synthetic corpus.
+
+      b. lifecycle ``<eventRef>`` whose ``@source`` IDREF resolves to a
+         ``<passiveRef>`` in ``<meta>/<references>``. Real Normattiva
+         consolidated files omit ``@type``/``@refersTo`` entirely but always
+         annotate each amending act in ``<references>`` as a ``<passiveRef>``.
+         Every such eventRef IS an amendment event; the ``<original>`` ref
+         (``@source`` resolves to an ``<original>`` element) is the enactment
+         itself and is therefore excluded.
+
+      c. ``@date`` on every modification element directly under
+         ``<passiveModifications>``. In some exports these carry inline dates
+         rather than referencing lifecycle events.
+    """
+    found: set[date] = set()
+
+    # Build the passiveRef eId set for source (b).
+    passive_eids = _passiveref_eids(tree)
+
+    for lc in tree.iter(f"{{{AKN_NS}}}lifecycle"):
+        for ev in lc.findall(f"{{{AKN_NS}}}eventRef"):
+            # Source (a): explicit type/refersTo stems.
+            marker = ((ev.get("type") or "") + " " + (ev.get("refersTo") or "")).lower()
+            is_amend_by_type = any(stem in marker for stem in _AMEND_STEMS)
+
+            # Source (b): @source IDREF → passiveRef.
+            source_ref = (ev.get("source") or "").lstrip("#")
+            is_amend_by_source = bool(source_ref and source_ref in passive_eids)
+
+            if is_amend_by_type or is_amend_by_source:
+                d = _parse_date(ev.get("date", ""))
+                if d is not None:
+                    found.add(d)
+
+    # Source (c): inline dates on passiveModification children.
+    for pm in tree.iter(f"{{{AKN_NS}}}passiveModifications"):
+        for mod in pm:
+            d = _parse_date(mod.get("date", ""))
+            if d is not None:
+                found.add(d)
+
+    return sorted(found)
+
+
+# --- typed reference relations ---------------------------------------
+
+# Modification @type stems (lowercased) that mean an end-of-life REPEAL.
+_RELATION_REPEAL_STEMS = ("repeal", "abrog")
+
+
+def _act_level_olf_id(olf_id: str) -> str:
+    """Strip a trailing ``/<eId>`` element fragment to get the ACT-LEVEL id.
+
+    ``olf:it/legge/2021/234/art_1__para_977`` → ``olf:it/legge/2021/234``.
+    An id that is already act-level (4 path segments after ``olf:``) is returned
+    unchanged.
+    """
+    body = olf_id[len("olf:"):] if olf_id.startswith("olf:") else olf_id
+    segments = body.split("/")
+    # olf:<jur>/<type>/<year>/<number>[/<eId>...]
+    act_segments = segments[:4]
+    return "olf:" + "/".join(act_segments)
+
+
+def _resolve_href_to_act_level(href: str) -> str | None:
+    """Resolve a modification destination href to an ACT-LEVEL OLF id, or None.
+
+    The href is first stripped of any ``#...`` and ``/~...`` (or bare ``~...``)
+    element fragment, then resolved with the scheme-appropriate mapper:
+
+      * ``urn:nir:...`` → :func:`urnlib.to_olf_id`
+      * ``/akn/...``     → :func:`urnlib.akn_uri_to_olf_id`
+
+    Any failure (unmapped type, malformed path, etc.) yields ``None`` — the
+    caller skips unresolvable destinations rather than guessing.
+    """
+    if not href:
+        return None
+    # Strip element fragments in either notation, then any trailing slash.
+    stripped = href.split("#", 1)[0]
+    stripped = stripped.split("~", 1)[0]
+    stripped = stripped.rstrip("/")
+    try:
+        if stripped.startswith("urn:nir:"):
+            return _act_level_olf_id(urnlib.to_olf_id(stripped))
+        if stripped.startswith("/akn/"):
+            olf = urnlib.akn_uri_to_olf_id(stripped)
+            return _act_level_olf_id(olf) if olf else None
+    except Exception:
+        return None
+    return None
+
+
+def _build_relation_maps(tree: etree._Element) -> tuple[set[str], set[str]]:
+    """Bucket modification destinations into (REPEALS, AMENDS) act-level OLF ids.
+
+    Reads ``<meta>/<analysis>/<activeModifications>`` and, when present,
+    ``<passiveModifications>`` (a passive modification is still a typed relation
+    to the other act). For each modification element we read ``@type`` and
+    resolve its ``<destination>/@href`` to an act-level OLF id:
+
+      * ``@type`` containing "repeal"/"abrog" → REPEALS
+      * any other modification type           → AMENDS
+
+    A destination that resolves into both buckets is treated as a REPEAL
+    (repeal dominates amend). Unresolvable destinations are skipped.
+    """
+    repeals: set[str] = set()
+    amends: set[str] = set()
+
+    containers = list(tree.iter(f"{{{AKN_NS}}}activeModifications"))
+    containers += list(tree.iter(f"{{{AKN_NS}}}passiveModifications"))
+
+    for container in containers:
+        for mod in container:
+            mod_type = (mod.get("type") or "").lower()
+            dest = mod.find(f"{{{AKN_NS}}}destination")
+            if dest is None:
+                continue
+            act_id = _resolve_href_to_act_level(dest.get("href", ""))
+            if act_id is None:
+                continue
+            if any(stem in mod_type for stem in _RELATION_REPEAL_STEMS):
+                repeals.add(act_id)
+            else:
+                amends.add(act_id)
+
+    # Repeal dominates: don't also report the same act as merely amended.
+    amends -= repeals
+    return repeals, amends
+
+
 def _normalize_refs(tree: etree._Element) -> list[str]:
-    """Resolve native ``<akn:ref href="...">`` to OLF ids and type them.
+    """Resolve native ``<akn:ref href="...">`` to OLF ids, type them, relate them.
 
     Real Normattiva documents cite other acts with the AKN naming-path scheme
     (``/akn/it/act/<type>/<authority>/<date>/<number>[/...][#frag]``), not
@@ -365,8 +693,22 @@ def _normalize_refs(tree: etree._Element) -> list[str]:
     *relationship*, not the text — refs are never dropped, only annotated. This
     function MUST NOT raise on any individual ref.
 
+    On each resolved ref we additionally stamp an ``olf:relation``, computed from
+    the ref's ACT-LEVEL OLF id against the modification maps built from
+    ``<analysis>`` (see :func:`_build_relation_maps`):
+
+      * act-level id in REPEALS          → ``"repeals"``
+      * elif in AMENDS                   → ``"amends"``
+      * elif the ref targets an EU act   → ``"implements"``
+        (AKN path type ``direttivaUe`` or authority ``eu``)
+      * else                             → ``"cites"``
+
+    Unresolved refs carry no relation (resolution-or-unresolved, nothing more).
+
     Returns the resolved OLF ids in document order, deduplicated.
     """
+    repeals, amends = _build_relation_maps(tree)
+
     out: list[str] = []
     seen: set[str] = set()
 
@@ -374,6 +716,16 @@ def _normalize_refs(tree: etree._Element) -> list[str]:
         if target not in seen:
             seen.add(target)
             out.append(target)
+
+    def _relation_for(target: str, href: str) -> str:
+        act_id = _act_level_olf_id(target)
+        if act_id in repeals:
+            return "repeals"
+        if act_id in amends:
+            return "amends"
+        if _is_eu_ref(href):
+            return "implements"
+        return "cites"
 
     for ref in tree.iter(f"{{{AKN_NS}}}ref"):
         href = ref.get("href", "")
@@ -384,14 +736,143 @@ def _normalize_refs(tree: etree._Element) -> list[str]:
                 ref.set(f"{{{OLF_NS}}}resolution", "unresolved")
                 continue
             ref.set(f"{{{OLF_NS}}}target", target)
+            ref.set(f"{{{OLF_NS}}}relation", _relation_for(target, href))
             _collect(target)
         elif href.startswith("/akn/"):
             target = urnlib.akn_uri_to_olf_id(href)
             if target is not None:
                 ref.set(f"{{{OLF_NS}}}target", target)
+                ref.set(f"{{{OLF_NS}}}relation", _relation_for(target, href))
                 _collect(target)
             else:
                 ref.set(f"{{{OLF_NS}}}resolution", "unresolved")
         else:
             ref.set(f"{{{OLF_NS}}}resolution", "unresolved")
     return out
+
+
+def _is_eu_ref(href: str) -> bool:
+    """True if an AKN-path href targets an EU act (implements relation).
+
+    Matches the ``/akn/<jur>/act/<type>/<authority>/...`` shape where either the
+    act type is an EU instrument (``direttivaue``, ``regolamentoue``, ...) or the
+    authority segment is ``eu``.
+    """
+    path = href.split("#", 1)[0]
+    if not path.startswith("/akn/"):
+        return False
+    segments = path.lstrip("/").split("/")
+    if len(segments) < 5:
+        return False
+    # akn / <jur> / act / <type> / <authority> / ...
+    akn_type = segments[3].lower()
+    authority = segments[4].lower()
+    if authority == "eu":
+        return True
+    if akn_type.endswith("ue") or "direttiva" in akn_type:
+        return True
+    return False
+
+
+# --- conformance gate ------------------------------------------------
+
+_OLF_ID_RE = re.compile(r"^olf:[a-z]{2}/")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _assert_conformant(akn_xml: bytes, olf_id: str) -> None:
+    """Lightweight in-adapter AKN4OLF gate; raise on the first failing criterion.
+
+    This honors base.py's transform contract — a document that would fail the
+    suite must never reach the archive. It is intentionally a subset of the full
+    reusable conformance suite (which lives in the spec repo); it checks only the
+    criteria we can verify cheaply from the serialized output:
+
+      1. the output re-parses as well-formed XML and has ``<akn:meta>``
+         (schema-valid-ish);
+      2. ``<olf:identity>`` exists with ``@olfId`` matching ``^olf:[a-z]{2}/``;
+      3. ``<olf:provenance>`` has a 64-hex ``@sourceSha256``, a non-empty
+         ``@adapter``, and a ``@generatedAt`` ending in ``Z``;
+      4. every ``<akn:ref>`` carries either ``olf:target`` or
+         ``olf:resolution="unresolved"`` (refs resolve-or-unresolved);
+      5. if both ``inForceFrom`` and ``inForceTo`` are present →
+         ``inForceFrom <= inForceTo`` (temporal monotonicity);
+      6. the ``<proprietary source="#openlawsfoundation">`` agent is declared
+         (a ``TLCOrganization eId="openlawsfoundation"`` exists).
+
+    Raises:
+        ConformanceError: naming the first failing criterion.
+    """
+    # Criterion 1: well-formed + has <akn:meta>.
+    try:
+        tree = etree.fromstring(akn_xml)
+    except etree.XMLSyntaxError as e:
+        raise ConformanceError(
+            f"conformance[1 well-formed]: output is not well-formed XML: {e}"
+        ) from e
+    if tree.find(f".//{{{AKN_NS}}}meta") is None:
+        raise ConformanceError(
+            "conformance[1 schema]: output has no <akn:meta>; not valid AKN"
+        )
+
+    # Criterion 2: <olf:identity>/@olfId.
+    identity = tree.find(f".//{{{OLF_NS}}}identity")
+    if identity is None:
+        raise ConformanceError("conformance[2 identity]: <olf:identity> is missing")
+    olf_attr = identity.get("olfId", "")
+    if not _OLF_ID_RE.match(olf_attr):
+        raise ConformanceError(
+            f"conformance[2 identity]: @olfId {olf_attr!r} does not match ^olf:[a-z]{{2}}/"
+        )
+
+    # Criterion 3: <olf:provenance>.
+    prov = tree.find(f".//{{{OLF_NS}}}provenance")
+    if prov is None:
+        raise ConformanceError("conformance[3 provenance]: <olf:provenance> is missing")
+    sha = prov.get("sourceSha256", "")
+    if not _SHA256_RE.match(sha):
+        raise ConformanceError(
+            f"conformance[3 provenance]: @sourceSha256 {sha!r} is not 64 hex chars"
+        )
+    if not (prov.get("adapter") or "").strip():
+        raise ConformanceError(
+            "conformance[3 provenance]: @adapter is empty"
+        )
+    gen = prov.get("generatedAt", "")
+    if not gen.endswith("Z"):
+        raise ConformanceError(
+            f"conformance[3 provenance]: @generatedAt {gen!r} does not end in 'Z'"
+        )
+
+    # Criterion 4: every <akn:ref> resolves-or-unresolved.
+    for ref in tree.iter(f"{{{AKN_NS}}}ref"):
+        has_target = ref.get(f"{{{OLF_NS}}}target") is not None
+        unresolved = ref.get(f"{{{OLF_NS}}}resolution") == "unresolved"
+        if not (has_target or unresolved):
+            raise ConformanceError(
+                f"conformance[4 refs]: <ref href={ref.get('href')!r}> has neither "
+                f"olf:target nor olf:resolution='unresolved'"
+            )
+
+    # Criterion 5: temporal monotonicity (only when both bounds present).
+    lifecycle = tree.find(f".//{{{OLF_NS}}}lifecycle")
+    if lifecycle is not None:
+        ff = _parse_date(lifecycle.get("inForceFrom", ""))
+        ft = _parse_date(lifecycle.get("inForceTo", ""))
+        if ff is not None and ft is not None and ff > ft:
+            raise ConformanceError(
+                f"conformance[5 temporal]: inForceFrom {ff.isoformat()} > "
+                f"inForceTo {ft.isoformat()} (non-monotonic)"
+            )
+
+    # Criterion 6: the OLF proprietary agent is declared.
+    declared = False
+    for org in tree.iter(f"{{{AKN_NS}}}TLCOrganization"):
+        if org.get("eId") == OLF_AGENT_EID:
+            declared = True
+            break
+    if not declared:
+        raise ConformanceError(
+            f"conformance[6 agent]: <proprietary source={OLF_PROPRIETARY_SOURCE!r}> "
+            f"points at an undeclared agent (no TLCOrganization eId={OLF_AGENT_EID!r})"
+        )
