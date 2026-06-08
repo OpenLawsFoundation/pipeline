@@ -25,9 +25,18 @@ import importlib
 import subprocess
 import sys
 from datetime import datetime
+from itertools import islice
 from pathlib import Path
+from typing import Iterable, Iterator, TypeVar
 
-from adapters.base import Adapter, ConformanceError
+from adapters.base import Adapter, ActRef, ConformanceError
+
+# Number of ActRefs to pull from discover() at a time before fetching/writing.
+# Keeps in-flight work bounded; if the run is killed, all prior chunks are
+# already committed+pushed and nothing is lost.
+_RUN_CHUNK_SIZE = 25
+
+_T = TypeVar("_T")
 
 
 def load_adapter(jurisdiction: str) -> Adapter:
@@ -39,6 +48,17 @@ def archive_path(archive_root: Path, olf_id: str) -> Path:
     # olf:it/legge/2019/123  ->  it/legge/2019/123.akn.xml
     body = olf_id.split(":", 1)[1]
     return archive_root / (body + ".akn.xml")
+
+
+def _chunked(iterable: Iterable[_T], n: int) -> Iterator[list[_T]]:
+    """Yield successive non-overlapping lists of up to *n* items from *iterable*
+    without materialising the whole iterable up-front."""
+    it = iter(iterable)
+    while True:
+        chunk = list(islice(it, n))
+        if not chunk:
+            return
+        yield chunk
 
 
 def _git(archive_root: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -64,12 +84,8 @@ def run(
     adapter = load_adapter(jurisdiction)
     print(f"adapter {adapter.name}@{adapter.version} | since={since or 'BACKFILL'}")
 
-    # Materialise the full ref list so we know the total count up-front (needed
-    # for the summary) and so we can hand the whole list to fetch_many at once.
-    refs = list(adapter.discover(since))
-    total = len(refs)
-
-    written = errors = committed = pushed = 0
+    written = errors = committed = pushed = processed = 0
+    chunk_num = 0
 
     def _commit_doc(out: Path, olf_id: str) -> None:
         """Git-add the file and commit it if the content actually changed."""
@@ -132,27 +148,41 @@ def run(
         if commit:
             _commit_doc(out, doc.ref.olf_id)
 
-    if hasattr(adapter, "fetch_many"):
-        # Batch path: all export jobs are submitted first; the server processes
-        # them in parallel, and we collect each result as it finishes.
-        # Wall-time ≈ slowest single job rather than O(N × per-job time).
-        for source_doc in adapter.fetch_many(refs):
-            _write_doc(source_doc)
-    else:
-        # Per-act fallback for adapters that do not implement fetch_many.
-        for ref in refs:
-            try:
-                source_doc = adapter.fetch(ref)
-            except Exception as e:  # noqa: BLE001
-                errors += 1
-                print(f"  FAIL {ref.olf_id}: fetch: {e}", file=sys.stderr)
-                continue
-            _write_doc(source_doc)
+    def _process_chunk(chunk: list[ActRef]) -> None:
+        """Fetch and write a single chunk of ActRefs."""
+        nonlocal errors
+        if hasattr(adapter, "fetch_many"):
+            # Batch path: submit all export jobs up-front; collect as each finishes.
+            for source_doc in adapter.fetch_many(chunk):
+                _write_doc(source_doc)
+        else:
+            # Per-act fallback for adapters that do not implement fetch_many.
+            for ref in chunk:
+                try:
+                    source_doc = adapter.fetch(ref)
+                except Exception as e:  # noqa: BLE001
+                    errors += 1
+                    print(f"  FAIL {ref.olf_id}: fetch: {e}", file=sys.stderr)
+                    continue
+                _write_doc(source_doc)
+
+    # Stream discover() in chunks so backfill builds incrementally and commits
+    # per-chunk rather than materialising the whole corpus before writing anything.
+    for chunk in _chunked(adapter.discover(since), _RUN_CHUNK_SIZE):
+        chunk_num += 1
+        chunk_written_before = written
+        processed += len(chunk)
+        _process_chunk(chunk)
+        chunk_written = written - chunk_written_before
+        print(
+            f"chunk {chunk_num}: {chunk_written} written, {errors} errors total"
+            f" | total written={written} processed={processed}"
+        )
 
     # skipped = refs that were discovered but never produced a SourceDocument
     # (submit failures or batch timeouts); errors = transform failures.
-    skipped = total - written - errors
-    summary = f"done: {written} written, {errors} errors, {skipped} skipped (of {total})"
+    skipped = processed - written - errors
+    summary = f"done: {written} written, {errors} errors, {skipped} skipped (of {processed})"
     if commit:
         summary += f", {committed} committed"
     if push:
@@ -162,7 +192,7 @@ def run(
     # and there was actually something to process, something is deeply wrong.
     # Per-act errors are reported but not fatal — one bad source act must not
     # block the whole daily run.
-    return 1 if (written == 0 and total > 0) else 0
+    return 1 if (written == 0 and processed > 0) else 0
 
 
 def main() -> int:

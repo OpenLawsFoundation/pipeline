@@ -11,8 +11,10 @@ The API exposes three capabilities this adapter uses:
      months, <= 7000 results). No URN field is returned; we *construct* the NIR
      URN from the act's denomination + provvedimento date/number.
 
-  2. BACKFILL ENUMERATION — ``POST /api/v1/ricerca/semplice`` paginates the
-     corpus (same item shape as ``aggiornati``).
+  2. BACKFILL ENUMERATION — ``POST /api/v1/ricerca/avanzata`` with just
+     ``annoProvvedimento`` (no text) enumerates ALL acts of that year, paginated.
+     Iterated year-by-year descending from the current UTC year down to
+     ``_BACKFILL_START_YEAR``.
 
   3. ACT AKN RETRIEVAL — an asynchronous export flow (the only way to get AKN):
      ``ricerca-asincrona/nuova-ricerca`` (202 + token) ->
@@ -65,10 +67,9 @@ DEFAULT_MULTIVIGENTE = True
 # under the 12-month ceiling regardless of month lengths / leap years.
 _MAX_WINDOW_DAYS = 360
 
-# Backfill keyword: ricerca/semplice rejects an empty testoRicerca, so we use the
-# Italian definite article "la", which matches effectively the whole corpus while
-# being an accepted, non-empty term.
-_BACKFILL_KEYWORD = "la"
+# Backfill start year: the earliest year of Italian acts (year of unification).
+# Overridable via config.yaml ``source.backfill_start_year``.
+_BACKFILL_START_YEAR = 1861
 
 # AKN namespace (for parsing FRBRalias urn:nir out of an export entry).
 _AKN_NS = "http://docs.oasis-open.org/legaldocml/ns/akn/3.0"
@@ -104,6 +105,7 @@ class NormattivaClient:
         self.export_poll_s = getattr(cfg, "export_poll_seconds", DEFAULT_EXPORT_POLL_SECONDS)
         self.export_max_wait_s = getattr(cfg, "export_max_wait_seconds", DEFAULT_EXPORT_MAX_WAIT_SECONDS)
         self.multivigente = getattr(cfg, "multivigente", DEFAULT_MULTIVIGENTE)
+        self.backfill_start_year = getattr(cfg, "backfill_start_year", _BACKFILL_START_YEAR)
         self.session = session or requests.Session()
         self.session.headers.update({"User-Agent": "openlawsfoundation-adapter-it"})
         self._last_call = 0.0
@@ -128,8 +130,10 @@ class NormattivaClient:
           in turn. Documented server error codes are surfaced as
           :class:`NormattivaError` (notably 1502 "too many results", a real
           signal that the caller should narrow the window).
-        * None -> BACKFILL via ``ricerca/semplice``, paginating the corpus until
-          ``paginaCorrente >= numeroPagine``.
+        * None -> BACKFILL via ``ricerca/avanzata`` with ``annoProvvedimento``,
+          iterating year-by-year descending from the current UTC year down to
+          ``_BACKFILL_START_YEAR``, paginating each year until
+          ``paginaCorrente >= numeroPagine``. Most-recent acts are yielded first.
 
         For each act we *construct* the NIR URN from its denomination + date +
         number (the API returns no URN). An item whose denomination is not in the
@@ -172,11 +176,23 @@ class NormattivaClient:
             window_start = window_end + timedelta(days=1)
 
     def _backfill(self) -> Iterator[ActRef]:
+        current_year = datetime.now(timezone.utc).year
+        for year in range(current_year, self.backfill_start_year - 1, -1):
+            try:
+                yield from self._backfill_year(year)
+            except Exception as exc:  # noqa: BLE001 - one bad year must not abort the whole backfill
+                print(
+                    f"[normattiva] backfill: skipping year {year} due to error: {exc}",
+                    file=sys.stderr,
+                )
+
+    def _backfill_year(self, year: int) -> Iterator[ActRef]:
+        """Paginate ``ricerca/avanzata`` for a single year, yielding ActRefs."""
         page = 1
         while True:
             self._throttle()
             body = {
-                "testoRicerca": _BACKFILL_KEYWORD,
+                "annoProvvedimento": str(year),
                 "orderType": "recente",
                 "paginazione": {
                     "paginaCorrente": page,
@@ -184,7 +200,7 @@ class NormattivaClient:
                 },
             }
             r = self.session.post(
-                f"{self.base_url}/api/v1/ricerca/semplice",
+                f"{self.base_url}/api/v1/ricerca/avanzata",
                 json=body,
                 timeout=self.timeout,
             )
