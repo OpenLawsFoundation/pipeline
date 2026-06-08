@@ -5,10 +5,23 @@ Normattiva addresses acts with NIR ("Norme in Rete") URNs:
     urn:nir:stato:legge:2007-12-24;244
     urn:nir:stato:decreto.legislativo:2003-06-30;196
     urn:nir:stato:legge:2007-12-24;244~art2-com428   (element fragment)
+    urn:nir:regione.lombardia:legge.regionale:2020-01-01;1
+    urn:nir:imprese.italy.made.ministero:decreto:2026-04-16;95
 
 We map the act-level URN to a stable OLF id and keep the native URN alongside it
-in the document metadata. The OLF id is what makes the archive navigable by
+in the document metadata.  The OLF id is what makes the archive navigable by
 jurisdiction; the URN is what resolves against Normattiva.
+
+OLF id scheme: ``olf:it/<type-slug>/<authority-slug>/<year>/<number>[/<eId>]``
+The authority is ALWAYS included — state acts use ``stato``, everything else uses
+the normalised NIR or FRBRuri authority slug.
+
+Examples::
+
+    urn:nir:stato:legge:2019-08-05;123                  ->  olf:it/legge/stato/2019/123
+    urn:nir:stato:decreto.legge:2026-05-22;89            ->  olf:it/decreto-legge/stato/2026/89
+    /akn/it/act/decreto-legge/stato/2026-05-22/89        ->  olf:it/decreto-legge/stato/2026/89
+    /akn/it/act/decreto/MINISTERO_DELLE_IMPRESE.../95    ->  olf:it/decreto/ministero-delle.../2026/95
 
 NOTE: this is the AKN4OLF identity normalization in practice — we normalize the
 *name*, never the content.
@@ -32,11 +45,40 @@ Canonical type resolution is a two-step pipeline:
    match established archive slugs (``dpr``, ``dpcm``).  Every other normalised
    type maps to its own hyphenated form — no unknown-type skip, no raise.
 
+The same ``_norm_type`` pipeline is used to normalise the authority slug.  For
+FRBRuri paths the authority arrives as an UPPERCASE_UNDERSCORE string (e.g.
+``MINISTERO_DELLE_IMPRESE_E_DEL_MADE_IN_ITALY``); for urn:nir it arrives as a
+dot-separated lowercase string (e.g. ``imprese.italy.made.ministero``).  Both are
+collapsed to a hyphenated lowercase slug, but the two encodings are DIFFERENT —
+see the caveat below.
+
+CAVEAT — dual authority encodings for non-state acts
+-----------------------------------------------------
+Normattiva encodes the same issuing authority differently depending on the source:
+
+*  FRBRuri (and body ``<ref>`` hrefs) use a SCREAMING_SNAKE form derived from the
+   full Italian institutional name, e.g.
+   ``MINISTERO_DELLE_IMPRESE_E_DEL_MADE_IN_ITALY`` → slug
+   ``ministero-delle-imprese-e-del-made-in-italy``.
+
+*  urn:nir uses an abbreviated dot-notation, e.g.
+   ``imprese.italy.made.ministero`` → slug ``imprese-italy-made-ministero``.
+
+State acts (authority ``stato``) are consistent in both forms and produce the
+canonical slug ``stato``.  For any other authority the urn:nir-sourced slug will
+NOT match the FRBRuri-sourced slug for the same act.
+
+Self-ids derive from FRBRuri (consistent, canonical).  Body ``<ref>`` hrefs also
+use the FRBRuri path form (consistent with self-ids).  However, if a non-state act
+is referenced exclusively through a urn:nir alias, the resulting authority slug
+will differ from that act's self-id.  Reconciling the two non-state encodings
+requires a Normattiva authority registry — that is out of scope for this module.
+
 Public API:
 
-* :func:`to_olf_id` — parse a NIR URN and derive the OLF id via the canonical rule.
-* :func:`akn_uri_to_olf_id` — resolve an AKN naming-path to an OLF id via the
-  same canonical rule.
+* :func:`parse` — parse a NIR URN into a :class:`ParsedUrn` (includes authority).
+* :func:`to_olf_id` — parse a NIR URN and derive the OLF id.
+* :func:`akn_uri_to_olf_id` — resolve an AKN naming-path to an OLF id.
 
 Legacy look-up tables ``_TYPE_MAP`` and ``_AKN_TYPE_TO_OLF`` are retained for
 compatibility with external callers that may import them; they are no longer used
@@ -49,11 +91,11 @@ import re
 from dataclasses import dataclass
 
 # ---------------------------------------------------------------------------
-# Canonical separator-agnostic type resolution
+# Canonical separator-agnostic type / authority resolution
 # ---------------------------------------------------------------------------
 
 def _norm_type(t: str) -> str:
-    """Normalise an act-type token to a canonical hyphenated slug.
+    """Normalise an act-type or authority token to a canonical hyphenated slug.
 
     Lowercases, strips surrounding whitespace, then collapses any run of
     separator characters (dot, underscore, hyphen, ASCII space) to a single
@@ -69,6 +111,10 @@ def _norm_type(t: str) -> str:
         'decreto-legge'
         >>> _norm_type("decretoLegge")        # camelCase is split into words
         'decreto-legge'
+        >>> _norm_type("MINISTERO_DELLE_IMPRESE_E_DEL_MADE_IN_ITALY")
+        'ministero-delle-imprese-e-del-made-in-italy'
+        >>> _norm_type("stato")
+        'stato'
     """
     # Split camelCase first — real AKN naming-path <ref> hrefs use forms like
     # "decretoDelPresidenteDellaRepubblica" — then collapse every separator.
@@ -147,8 +193,13 @@ _AKN_TYPE_TO_OLF: dict[str, str] = {
 # URN parsing
 # ---------------------------------------------------------------------------
 
+# Matches any urn:nir URN — authority is now a captured group (any authority,
+# not only 'stato').  The authority token uses dot-separated lowercase identifiers
+# as per NIR convention (e.g. "stato", "regione.lombardia",
+# "imprese.italy.made.ministero").
 _URN_RE = re.compile(
-    r"^urn:nir:stato:(?P<type>[a-z][a-z.\-]+):(?P<date>\d{4}-\d{2}-\d{2});(?P<num>[^~]+)"
+    r"^urn:nir:(?P<authority>[a-z0-9.\-]+):(?P<type>[a-z][a-z0-9.\-]+)"
+    r":(?P<date>\d{4}-\d{2}-\d{2});(?P<num>[^~]+)"
     r"(?:~(?P<frag>.+))?$"
 )
 
@@ -158,10 +209,11 @@ _FULL_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 @dataclass(frozen=True)
 class ParsedUrn:
-    act_type: str   # native NIR type, e.g. "decreto.legislativo"
+    act_type: str       # native NIR type, e.g. "decreto.legislativo"
     year: int
     number: str
     fragment: str | None  # e.g. "art2-com428", or None for the whole act
+    authority: str      # NIR authority token, e.g. "stato", "regione.lombardia"
 
 
 def parse(urn: str) -> ParsedUrn:
@@ -173,24 +225,34 @@ def parse(urn: str) -> ParsedUrn:
         year=int(m["date"][:4]),
         number=m["num"],
         fragment=m["frag"],
+        authority=m["authority"],
     )
 
 
 def to_olf_id(urn: str) -> str:
-    """urn:nir:stato:legge:2019-08-05;123  ->  olf:it/legge/2019/123
+    """urn:nir:<authority>:<type>:<date>;<num>  ->  olf:it/<type-slug>/<authority-slug>/<year>/<num>
+
+    The authority is ALWAYS included in the OLF id.  State acts use the slug
+    ``stato``; other authorities are normalised via :func:`_norm_type`.
 
     The act-type slug is resolved via :func:`_norm_type` + ``_SLUG_ALIASES``,
     so dot, underscore, and hyphen separators are all handled identically.
 
-    Element fragments map onto the AKN eId form:
-    ...;123~art2  ->  olf:it/legge/2019/123/art_2
+    Element fragments map onto the AKN eId form::
+
+        urn:nir:stato:legge:2019-08-05;123~art2  ->  olf:it/legge/stato/2019/123/art_2
+
+    CAVEAT: for non-state acts the urn:nir authority slug (dot-separated,
+    abbreviated) differs from the FRBRuri authority slug (SCREAMING_SNAKE, full
+    name).  See module docstring for details.
 
     Raises :class:`ValueError` only for genuinely malformed URNs (parse failure).
     Every well-formed URN yields a deterministic OLF id.
     """
     p = parse(urn)
     olf_type = _type_to_slug(p.act_type)
-    base = f"olf:it/{olf_type}/{p.year}/{p.number}"
+    authority_slug = _norm_type(p.authority)
+    base = f"olf:it/{olf_type}/{authority_slug}/{p.year}/{p.number}"
     if p.fragment:
         return f"{base}/{_fragment_to_eid(p.fragment)}"
     return base
@@ -220,11 +282,17 @@ def akn_uri_to_olf_id(href: str) -> str | None:
     hyphens in older exports, camelCase in synthetic documents).  All forms are
     resolved via :func:`_norm_type` + ``_SLUG_ALIASES``.
 
-    Returns an OLF id (``olf:it/<type>/<year>/<number>[/<eid>]``) only for
-    Italian state acts (jurisdiction == "it", authority == "stato") with a full
-    ``YYYY-MM-DD`` date.  Returns ``None`` — without raising — for everything
-    else (EU acts, empty authority, year-only dates, non-Italian jurisdictions).
-    Every well-formed Italian state-act path yields a deterministic OLF id.
+    The ``<authority>`` segment is normalised via :func:`_norm_type`; FRBRuri uses
+    SCREAMING_SNAKE (e.g. ``MINISTERO_DELLE_IMPRESE_E_DEL_MADE_IN_ITALY``) which
+    is collapsed to a lowercase hyphenated slug.  The authority is ALWAYS included
+    in the returned OLF id (including ``stato``).
+
+    Returns an OLF id (``olf:it/<type>/<authority>/<year>/<number>[/<eid>]``) only
+    for Italian acts (jurisdiction == "it") with a full ``YYYY-MM-DD`` date.
+    Returns ``None`` — without raising — for everything else: EU acts, year-only
+    dates, non-Italian jurisdictions, or missing segments.
+
+    Every well-formed Italian act path yields a deterministic OLF id.
     """
     try:
         # Split fragment first.
@@ -249,14 +317,13 @@ def akn_uri_to_olf_id(href: str) -> str | None:
             return None
         if literal_act != "act":
             return None
-        if authority != "stato":
-            return None
         if not _FULL_DATE_RE.match(date_seg):
             return None
 
         olf_type = _type_to_slug(akn_type)
+        authority_slug = _norm_type(authority)
         year = date_seg[:4]
-        base = f"olf:it/{olf_type}/{year}/{number}"
+        base = f"olf:it/{olf_type}/{authority_slug}/{year}/{number}"
 
         if fragment:
             # Fragment is already in eId form (e.g. "art_77"); just append.
