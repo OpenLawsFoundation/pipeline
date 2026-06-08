@@ -20,7 +20,9 @@ concurrency:
 
 jobs:
   generate:
-    runs-on: ubuntu-latest
+    # Must run where Normattiva is reachable: a self-hosted runner with a
+    # residential/allowed egress (GitHub-hosted Azure IPs are firewalled).
+    runs-on: [self-hosted, socks-egress]
     steps:
       - name: Checkout pipeline
         uses: actions/checkout@v4
@@ -36,14 +38,17 @@ jobs:
           # stored as an org/repo secret. Never commit it.
           token: ${{ secrets.ARCHIVE_WRITE_TOKEN }}
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+      # uv pulls a portable Python (setup-python has no ARM64/Ubuntu-20.04 build).
+      - name: Set up Python 3.12 (uv)
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Install deps
         working-directory: pipeline
-        run: pip install -r requirements.txt
+        run: |
+          uv venv --python 3.12 "$RUNNER_TEMP/olfvenv"
+          uv pip install --python "$RUNNER_TEMP/olfvenv/bin/python" -r requirements.txt
 
       - name: Compute "since" (last successful run)
         id: since
@@ -55,7 +60,7 @@ jobs:
       - name: Generate AKN4OLF documents
         working-directory: pipeline/pipeline
         run: |
-          python -m adapters.runner.run \
+          "$RUNNER_TEMP/olfvenv/bin/python" -m adapters.runner.run \
             --jurisdiction it \
             --archive "${GITHUB_WORKSPACE}/archive" \
             --since "${{ steps.since.outputs.value }}" \
