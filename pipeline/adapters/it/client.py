@@ -641,9 +641,22 @@ def _extract_akn_from_zip(content: bytes, ref: ActRef) -> bytes:
     codice = (ref.codice_redazionale or "").strip()
 
     with zipfile.ZipFile(io.BytesIO(content)) as zf:
-        all_xml_names = [n for n in zf.namelist() if n.lower().endswith(".xml")]
+        all_names = zf.namelist()
+        all_xml_names = [n for n in all_names if n.lower().endswith(".xml")]
         if not all_xml_names:
-            raise NormattivaError("Export ZIP contains no .xml entry")
+            if not all_names:
+                # Normattiva returns an empty ZIP (~22 bytes) when it has no AKN
+                # for the act yet — typically a very recently published act whose
+                # AKN hasn't been generated upstream. Not an error in the act or
+                # our query; it will be picked up on a later run (transform is
+                # idempotent, re-runs fill gaps).
+                raise NormattivaError(
+                    "empty export ZIP — no AKN generated upstream yet "
+                    "(recently published act); will be retried on a later run"
+                )
+            raise NormattivaError(
+                f"export ZIP has entries but no AKN .xml: {all_names[:5]}"
+            )
 
         # Step 0: narrow to the requested act by codiceRedazionale when possible.
         xml_names = all_xml_names
