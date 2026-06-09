@@ -419,9 +419,17 @@ class NormattivaClient:
         Returns the ``x-ipzs-location`` download URL when HTTP 303 (done), or
         ``None`` when the export is still processing (409 / 200 / 202).  Any
         other status raises via ``raise_for_status``.
+
+        The GET itself is wrapped against TRANSIENT network errors
+        (``requests.RequestException`` — read/connect timeouts, dropped SOCKS
+        reads, ...): such a failure is retried with backoff and, if still failing,
+        surfaces as :class:`_ThrottledError` rather than a raw exception. The
+        status-code branching is preserved: 200/202/409 are normal "still
+        processing" responses here and must NOT be treated as throttle, so we use
+        a non-raising GET and inspect the code ourselves.
         """
         url = f"{self.base_url}/api/v1/ricerca-asincrona/check-status/{token}"
-        r = self.session.get(url, allow_redirects=False, timeout=self.timeout)
+        r = self._get_no_raise_with_backoff(url, what="check-status", allow_redirects=False)
         if r.status_code == 303:
             location = r.headers.get("x-ipzs-location")
             if not location:
@@ -436,67 +444,124 @@ class NormattivaClient:
             f"Unexpected check-status response {r.status_code} for {token}"
         )
 
+    def _get_no_raise_with_backoff(self, url: str, *, what: str, **kwargs):
+        """GET ``url`` retrying ONLY on transient network errors, returning the
+        raw response WITHOUT calling ``raise_for_status``.
+
+        Unlike :meth:`_request_with_backoff` this never inspects the HTTP status
+        (the caller does), so a 409 "still processing" is returned normally rather
+        than mistaken for a throttle. A ``requests.RequestException`` is retried
+        with the same backoff schedule and, once exhausted, re-raised as
+        :class:`_ThrottledError` so the batch loop handles it non-fatally.
+        """
+        last_reason: str | None = None
+        for attempt in range(len(self._THROTTLE_BACKOFFS) + 1):
+            self._throttle()
+            try:
+                return self.session.get(url, timeout=self.timeout, **kwargs)
+            except requests.RequestException as exc:
+                last_reason = f"{type(exc).__name__}: {exc}"
+            if attempt >= len(self._THROTTLE_BACKOFFS):
+                break
+            sleep_s = self._THROTTLE_BACKOFFS[attempt]
+            print(
+                f"[normattiva] {what}: transient failure ({last_reason}); "
+                f"backing off {sleep_s:.0f}s (attempt {attempt + 1})",
+                file=sys.stderr,
+            )
+            time.sleep(sleep_s)
+        raise _ThrottledError(
+            f"{what} still failing ({last_reason}) after "
+            f"{len(self._THROTTLE_BACKOFFS)} backoffs"
+        )
+
     def _download_akn_url(self, download_url: str, ref: ActRef) -> tuple[bytes, str]:
         """GET the ZIP at ``download_url``, extract and return ``(bytes, url)``.
 
         Selection matches the act by ``ref.codice_redazionale`` (embedded in the
         ZIP entry/folder names) and then the latest-VIGENZA-≤-today version; see
         :func:`_extract_akn_from_zip`.
+
+        The GET is wrapped against transient network errors AND a throttled ZIP
+        endpoint (409/429) via :meth:`_request_with_backoff`; a still-failing
+        download raises :class:`_ThrottledError`, handled non-fatally by the batch
+        loop (the act re-surfaces on a later run).
         """
-        self._throttle()
-        r = self.session.get(download_url, timeout=self.timeout)
-        r.raise_for_status()
+        r = self._request_with_backoff("get", download_url, what="zip-download")
         akn_bytes = _extract_akn_from_zip(r.content, ref)
         return akn_bytes, download_url
 
-    # Backoff schedule (seconds) for a globally-throttled nuova-ricerca submit.
+    # Backoff schedule (seconds) for a globally-throttled or network-failed
+    # request. Each entry is the wait BEFORE the next retry, so the request is
+    # tried len(schedule)+1 times in total (initial attempt + one per step).
     _THROTTLE_BACKOFFS = (5.0, 10.0, 20.0)
     # HTTP status codes that mean "you are being throttled, back off".
     _THROTTLE_STATUS = (409, 429)
 
-    def _post_with_throttle_backoff(self, url: str, *, json: dict):
-        """POST ``url`` (throttled), retrying on 409/429 with exponential backoff.
+    def _request_with_backoff(self, method: str, url: str, *, what: str, **kwargs):
+        """Issue one HTTP request, retrying on throttle (409/429) AND on any
+        transient network error (``requests.RequestException`` — ReadTimeout,
+        ConnectTimeout, ConnectionError, ChunkedEncodingError, ...).
 
-        Each attempt is preceded by the normal good-citizen ``_throttle``. On a
-        throttle response we sleep the next backoff step (honoring ``Retry-After``
-        if the server sends one), then retry. After the schedule is exhausted we
-        raise :class:`_ThrottledError` carrying the last status — the batch loop
-        treats that as a clean stop-and-resume signal rather than a crash.
+        Each attempt is preceded by the good-citizen ``_throttle``. On a throttle
+        status we back off the next schedule step (honoring ``Retry-After`` when
+        present); on a network error we back off the same schedule. After the
+        schedule is exhausted we raise :class:`_ThrottledError` carrying the last
+        reason — every caller in the export flow treats that as a controlled
+        stop/skip signal, NEVER letting a raw ``RequestException`` escape and kill
+        the run.
 
-        Any non-throttle HTTPError propagates unchanged (per-act, handled by the
-        caller as a normal skip).
+        Any non-throttle ``HTTPError`` (a real 4xx/5xx that is not 409/429)
+        propagates unchanged — that is a genuine per-act problem the caller maps
+        to a normal skip.
+
+        ``method`` is one of ``"get"`` / ``"post"`` / ``"put"``; ``what`` is a
+        short label for the log line (e.g. ``"nuova-ricerca"``). ``kwargs`` are
+        forwarded to the session method (``json=``, ``allow_redirects=``, ...).
         """
-        last_status: int | None = None
-        # len(backoffs)+1 attempts: an initial try plus one retry per backoff step.
+        send = getattr(self.session, method)
+        last_reason: str | None = None
         for attempt in range(len(self._THROTTLE_BACKOFFS) + 1):
             self._throttle()
-            r = self.session.post(url, json=json, timeout=self.timeout)
+            retry_after: float | None = None
             try:
+                r = send(url, timeout=self.timeout, **kwargs)
                 r.raise_for_status()
             except requests.HTTPError as exc:
-                status = getattr(getattr(exc, "response", None), "status_code", None)
+                resp = getattr(exc, "response", None)
+                status = getattr(resp, "status_code", None)
                 if status not in self._THROTTLE_STATUS:
-                    raise
-                last_status = status
-                if attempt >= len(self._THROTTLE_BACKOFFS):
-                    break  # schedule exhausted; give up below
-                retry_after = self._retry_after_seconds(r)
-                sleep_s = (
-                    retry_after if retry_after is not None
-                    else self._THROTTLE_BACKOFFS[attempt]
-                )
-                print(
-                    f"[normattiva] throttled ({status}) on nuova-ricerca; "
-                    f"backing off {sleep_s:.0f}s (attempt {attempt + 1})",
-                    file=sys.stderr,
-                )
-                time.sleep(sleep_s)
-                continue
-            return r
+                    raise  # genuine 4xx/5xx — caller handles as a per-act skip
+                last_reason = f"HTTP {status}"
+                retry_after = self._retry_after_seconds(resp)
+            except requests.RequestException as exc:
+                # Transient network failure (timeout, reset connection, broken
+                # SOCKS read, ...). Back off and retry like a throttle.
+                last_reason = f"{type(exc).__name__}: {exc}"
+            else:
+                return r
+            if attempt >= len(self._THROTTLE_BACKOFFS):
+                break  # schedule exhausted; give up below
+            sleep_s = (
+                retry_after if retry_after is not None
+                else self._THROTTLE_BACKOFFS[attempt]
+            )
+            print(
+                f"[normattiva] {what}: transient failure ({last_reason}); "
+                f"backing off {sleep_s:.0f}s (attempt {attempt + 1})",
+                file=sys.stderr,
+            )
+            time.sleep(sleep_s)
         raise _ThrottledError(
-            f"nuova-ricerca still throttled (HTTP {last_status}) after "
+            f"{what} still failing ({last_reason}) after "
             f"{len(self._THROTTLE_BACKOFFS)} backoffs"
         )
+
+    def _post_with_throttle_backoff(self, url: str, *, json: dict):
+        """POST ``url`` with throttle + network-error backoff (see
+        :meth:`_request_with_backoff`). Kept as a thin wrapper because the submit
+        path and tests refer to it by name."""
+        return self._request_with_backoff("post", url, what="nuova-ricerca", json=json)
 
     @staticmethod
     def _retry_after_seconds(response) -> float | None:
@@ -554,13 +619,15 @@ class NormattivaClient:
         return text.strip('"')
 
     def _export_confirm(self, token: str) -> None:
-        self._throttle()
-        r = self.session.put(
+        # Wrapped against throttle (409/429) AND transient network errors; a
+        # still-failing confirm raises _ThrottledError, which the batch submit
+        # loop treats as a clean stop-and-resume signal (never fatal).
+        r = self._request_with_backoff(
+            "put",
             f"{self.base_url}/api/v1/ricerca-asincrona/conferma-ricerca",
+            what="conferma-ricerca",
             json={"token": token},
-            timeout=self.timeout,
         )
-        r.raise_for_status()
         try:
             data = r.json()
         except ValueError:

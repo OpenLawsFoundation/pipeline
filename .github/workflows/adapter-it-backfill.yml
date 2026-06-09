@@ -19,6 +19,7 @@ on:
 
 permissions:
   contents: read
+  actions: write
 
 concurrency:
   group: adapter-it-backfill
@@ -66,4 +67,46 @@ jobs:
             --backfill \
             --commit --push \
             --git-name "normattiva-adapter" \
-            --git-email "normattiva-adapter@users.noreply.github.com"
+            --git-email "normattiva-adapter@users.noreply.github.com" \
+            --status-file "$RUNNER_TEMP/backfill-status.txt"
+
+      # The corpus (~142k acts) is far larger than one run can archive: Normattiva
+      # throttles the async export after a few hundred jobs, and Actions caps a job
+      # at 24h. The run above stops cleanly (exit 0) at the throttle/soft-deadline,
+      # having committed its progress + an updated resume ledger. Here we re-dispatch
+      # the SAME workflow to pick up where it left off — but ONLY while it is making
+      # forward progress, so a throttled run with nothing new does NOT loop forever.
+      - name: Continue backfill if incomplete
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.ARCHIVE_WRITE_TOKEN }}
+        run: |
+          STATUS_FILE="$RUNNER_TEMP/backfill-status.txt"
+          if [ ! -f "$STATUS_FILE" ]; then
+            echo "No status file at $STATUS_FILE — backfill step did not complete; not re-dispatching."
+            exit 0
+          fi
+          echo "----- backfill status -----"
+          cat "$STATUS_FILE"
+          echo "---------------------------"
+          COMPLETE="$(grep -E '^BACKFILL_COMPLETE=' "$STATUS_FILE" | tail -1 | cut -d= -f2)"
+          PROGRESS="$(grep -E '^BACKFILL_PROGRESS=' "$STATUS_FILE" | tail -1 | cut -d= -f2)"
+          REMAINING="$(grep -oE 'remaining=[0-9]+' "$STATUS_FILE" | tail -1 | cut -d= -f2)"
+          PROGRESS="${PROGRESS:-0}"
+          echo "parsed: complete=$COMPLETE progress=$PROGRESS remaining=$REMAINING"
+
+          if [ "$COMPLETE" = "true" ]; then
+            echo "Backfill COMPLETE (remaining=0). Not re-dispatching."
+            exit 0
+          fi
+          if [ "$PROGRESS" -le 0 ] 2>/dev/null; then
+            echo "Run made ZERO progress (throttled with nothing new). Not re-dispatching to avoid an infinite no-progress loop; a later manual/cron run can resume."
+            exit 0
+          fi
+
+          echo "Incomplete and made progress ($PROGRESS this run, $REMAINING remaining). Cooling down before re-dispatch so Normattiva's export throttle resets..."
+          sleep 1200
+          echo "Re-dispatching adapter-it-backfill.yml (runner=${{ github.event.inputs.runner }})"
+          gh workflow run adapter-it-backfill.yml \
+            -f runner="${{ github.event.inputs.runner }}" \
+            -R "${{ github.repository }}"
