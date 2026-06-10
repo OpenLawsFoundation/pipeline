@@ -17,7 +17,7 @@ from .client import NormattivaClient, AKN_MEDIA_TYPE
 
 class ItalyAdapter:
     name = "normattiva-it"
-    version = "0.1.0"        # bump to force regeneration of all IT documents
+    version = "0.2.0"        # bump to force regeneration of all IT documents
     jurisdiction = "it"
 
     def __init__(self, client: NormattivaClient | None = None):

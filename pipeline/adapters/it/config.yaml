@@ -24,9 +24,14 @@ source:
   # poll check-status every export_poll_seconds up to export_max_wait_seconds.
   export_poll_seconds: 5.0
   export_max_wait_seconds: 600.0
-  # Request the full multi-version (multivigente) AKN so the temporal history is
-  # inside the document.
-  multivigente: true
+  # AKN export mode (Normattiva richiestaExport):
+  #   "V" = vigente      -> the single CURRENT consolidated, in-force text
+  #   "O" = originale    -> the as-enacted text (we do NOT serve this)
+  #   "M" = multivigente -> EVERY historical version of the act
+  # We request "V" so each act ships ONE current file, not its whole timeline.
+  # The current consolidated text still carries its full amendment apparatus
+  # (<lifecycle>/<analysis>) inside that one document.
+  export_mode: "V"
 
 incremental:
   # Overlap window subtracted from "last run" when computing `since`.
