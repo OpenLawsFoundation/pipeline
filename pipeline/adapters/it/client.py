@@ -22,8 +22,10 @@ The API exposes three capabilities this adapter uses:
      ``ricerca-asincrona/nuova-ricerca`` (202 + token) ->
      ``ricerca-asincrona/conferma-ricerca`` (PUT) ->
      poll ``ricerca-asincrona/check-status/<token>`` until HTTP 303 carries the
-     download URL in the ``x-ipzs-location`` header -> GET that URL for a ZIP of
-     AKN XML.
+     download URL in the ``x-ipzs-location`` header -> GET that URL for a ZIP
+     holding the act's CURRENT consolidated (vigente) AKN XML. We send
+     ``richiestaExport:"V"`` so the export is ONE current file, not the act's
+     entire version history (see ``DEFAULT_EXPORT_MODE``).
 
   4. URN RESOLVER (human): ``{urn_resolver}?{native_urn}``.
 
@@ -58,10 +60,20 @@ AKN_MEDIA_TYPE = "application/akn+xml"
 
 # Async-export polling defaults. Exports can take minutes; these are sane,
 # good-citizen defaults overridable via config.yaml (source.export_poll_seconds /
-# source.export_max_wait_seconds). Multivigente toggles full version history.
+# source.export_max_wait_seconds).
 DEFAULT_EXPORT_POLL_SECONDS = 5.0
 DEFAULT_EXPORT_MAX_WAIT_SECONDS = 600.0
-DEFAULT_MULTIVIGENTE = True
+# Normattiva export mode (richiestaExport): "V" = vigente (the single CURRENT
+# consolidated in-force text — what we serve), "O" = originale (as-enacted),
+# "M" = multivigente (EVERY historical version). We request "V" so each act
+# ships ONE current file instead of its whole timeline: a heavily-amended act is
+# ~1 MB vs ~190 MB (D.Lgs 152/2006 = 1 current file vs 222 versions / 1.2 GB),
+# with byte-identical current content and no server-side export throttle.
+DEFAULT_EXPORT_MODE = "V"
+# Accepted Normattiva richiestaExport values. Guarded at construction so a YAML
+# typo fails fast loudly instead of making EVERY export get rejected server-side
+# (which would silently produce an empty archive).
+_VALID_EXPORT_MODES = {"V", "O", "M"}
 
 # The aggiornati window is capped server-side at 12 months (error 1501). We chunk
 # anything wider into successive <= 12-month windows. Use 360 days to stay safely
@@ -112,7 +124,12 @@ class NormattivaClient:
         # configs without them keep working via getattr fallbacks).
         self.export_poll_s = getattr(cfg, "export_poll_seconds", DEFAULT_EXPORT_POLL_SECONDS)
         self.export_max_wait_s = getattr(cfg, "export_max_wait_seconds", DEFAULT_EXPORT_MAX_WAIT_SECONDS)
-        self.multivigente = getattr(cfg, "multivigente", DEFAULT_MULTIVIGENTE)
+        self.export_mode = getattr(cfg, "export_mode", DEFAULT_EXPORT_MODE)
+        if self.export_mode not in _VALID_EXPORT_MODES:
+            raise ValueError(
+                f"invalid export_mode {self.export_mode!r}; expected one of "
+                f"{sorted(_VALID_EXPORT_MODES)} (V=vigente, O=originale, M=multivigente)"
+            )
         self.backfill_start_year = getattr(cfg, "backfill_start_year", _BACKFILL_START_YEAR)
         self.session = session or requests.Session()
         self.session.headers.update({"User-Agent": "openlawsfoundation-adapter-it"})
@@ -260,9 +277,9 @@ class NormattivaClient:
           2. PUT ``ricerca-asincrona/conferma-ricerca`` ``{"token": ...}``.
           3. Poll GET ``ricerca-asincrona/check-status/<token>`` until HTTP 303;
              the download URL is in the ``x-ipzs-location`` response header.
-          4. GET the download URL -> a ZIP of AKN XML; the entry/folder whose
-             name embeds ``ref.codice_redazionale`` is selected, then the latest
-             VIGENZA-≤-today version of that act is returned.
+          4. GET the download URL -> a ZIP holding the act's CURRENT consolidated
+             (vigente) AKN XML; the entry whose name embeds
+             ``ref.codice_redazionale`` is selected and returned.
 
         ``source_url`` is the ``x-ipzs-location`` download URL (provenance).
 
@@ -479,7 +496,7 @@ class NormattivaClient:
         """GET the ZIP at ``download_url``, extract and return ``(bytes, url)``.
 
         Selection matches the act by ``ref.codice_redazionale`` (embedded in the
-        ZIP entry/folder names) and then the latest-VIGENZA-≤-today version; see
+        ZIP entry names) and returns its current consolidated version; see
         :func:`_extract_akn_from_zip`.
 
         The GET is wrapped against transient network errors AND a throttled ZIP
@@ -599,7 +616,7 @@ class NormattivaClient:
                 },
             },
         }
-        body["richiestaExport"] = "M" if self.multivigente else "O"
+        body["richiestaExport"] = self.export_mode  # "V" = current consolidated; see DEFAULT_EXPORT_MODE
         r = self._post_with_throttle_backoff(
             f"{self.base_url}/api/v1/ricerca-asincrona/nuova-ricerca",
             json=body,
@@ -669,37 +686,37 @@ def _raise_for_api_error(data: object) -> None:
 
 
 def _extract_akn_from_zip(content: bytes, ref: ActRef) -> bytes:
-    """Pull the current consolidated AKN XML out of a Normattiva export ZIP.
+    """Pull the act's CURRENT consolidated AKN XML out of a Normattiva export ZIP.
 
-    Normattiva ships ``richiestaExport:"M"`` (multivigente) results as a ZIP of
-    SEPARATE per-version files, one per consolidation point, e.g.:
+    With ``richiestaExport:"V"`` (vigente) the export holds ONE file per matched
+    act — the current consolidated, in-force version, named e.g.::
 
-        DECRETO-LEGGE_20060403_152_..._06G00110_ORIGINALE_V0.xml
-        DECRETO-LEGGE_20060403_152_..._06G00110_VIGENZA_2006-07-13_V1.xml
-        DECRETO-LEGGE_20060403_152_..._06G00110_VIGENZA_2021-06-01_V141.xml
-        ...
+        DECRETO-LEGISLATIVO_20060414_152_..._006G0171_VIGENZA_2026-06-10_V0.xml
 
-    A single export can contain MORE THAN ONE act (the search may match several);
-    every entry name embeds the act's ``codiceRedazionale`` (e.g. ``_24G00035_``).
-    We therefore FIRST narrow to the act we asked for by matching
-    ``ref.codice_redazionale`` against the entry names, and only then pick the
-    CURRENT consolidated version — the latest VIGENZA entry whose date is not in
-    the future (≤ today UTC).  That file itself carries the full amendment history
-    in its ``<lifecycle>``/``<analysis>`` blocks, so downstream transforms see all
-    amendment events without reassembling versions.  Assembling every version into
-    one temporal AKN document is a separate future concern and out of scope here.
+    That single file already carries the act's full amendment apparatus in its
+    ``<lifecycle>``/``<analysis>`` blocks, so the transform sees every amendment
+    event without us downloading the prior versions. (Under the old ``"M"``
+    multivigente mode the ZIP instead held one SEPARATE file per consolidation
+    point — hundreds for a heavily-amended act, ~1.2 GB for D.Lgs 152/2006 — of
+    which only the latest was ever kept; ``"V"`` ships just that one.)
 
-    Selection algorithm:
+    A single export can still contain MORE THAN ONE act (the search may match
+    several); every entry name embeds the act's ``codiceRedazionale`` (e.g.
+    ``_006G0171_``), so we FIRST narrow to the requested act by matching
+    ``ref.codice_redazionale`` against the entry names.
+
+    Selection algorithm (robust to both ``"V"`` and a stray legacy multi-version ZIP):
       0. If ``ref.codice_redazionale`` is set and at least one entry name contains
-         it, restrict the candidate entries to that act; otherwise keep all
-         entries (best-effort fallback for codice-less refs / odd exports).
-      1. Parse each ``_VIGENZA_<YYYY-MM-DD>_V<n>`` entry; collect (date, n, name).
-      2. Keep only those with date ≤ today UTC.
-      3. Pick the one with the latest date; tie-break on highest V<n>.
-      4. If no VIGENZA entries pass the filter (un-amended act — only ORIGINALE),
-         use the ORIGINALE_V0 entry.
-      5. If filenames don't match either pattern at all, fall back to
-         FRBRalias-match (against ``ref.native_urn`` when known) then first-xml.
+         it, restrict the candidates to that act; otherwise keep all entries
+         (best-effort fallback for codice-less refs / odd exports).
+      1. If exactly one candidate remains (the normal ``"V"`` case), return it.
+      2. Otherwise parse each ``_VIGENZA_<YYYY-MM-DD>_V<n>`` entry, keep those
+         dated ≤ today UTC, and pick the latest (tie-break on highest V<n>) — the
+         CURRENT in-force version, never a future-dated one.
+      3. If no VIGENZA entry qualifies (un-amended act — only ORIGINALE), use the
+         ORIGINALE_V0 entry.
+      4. If filenames match neither pattern, fall back to FRBRalias-match (against
+         ``ref.native_urn`` when known) then the first xml.
     """
     import re
 

@@ -30,7 +30,15 @@ class SourceConfig:
     # defaults are sane for a public institutional API.
     export_poll_seconds: float = 5.0
     export_max_wait_seconds: float = 600.0
-    multivigente: bool = True
+    # AKN export mode (Normattiva ``richiestaExport``):
+    #   "V" = vigente      -> the single CURRENT consolidated, in-force text
+    #   "O" = originale    -> the as-enacted text (we do NOT serve this)
+    #   "M" = multivigente -> EVERY historical version of the act
+    # We request "V": one current file per act instead of the whole timeline, so
+    # a heavily-amended act ships ~1 MB rather than ~190 MB (e.g. D.Lgs 152/2006
+    # is 1 current file vs 222 versions / 1.2 GB) — same archived content, far
+    # less bandwidth, and no server-side export throttle.
+    export_mode: str = "V"
     # Earliest year to enumerate in backfill mode (year of Italian unification).
     # Override via config.yaml ``source.backfill_start_year``.
     backfill_start_year: int = 1861
@@ -85,7 +93,7 @@ def load(path: Path | None = None) -> Config:
             page_size=int(src.get("page_size", SourceConfig.page_size)),
             export_poll_seconds=float(src.get("export_poll_seconds", SourceConfig.export_poll_seconds)),
             export_max_wait_seconds=float(src.get("export_max_wait_seconds", SourceConfig.export_max_wait_seconds)),
-            multivigente=bool(src.get("multivigente", SourceConfig.multivigente)),
+            export_mode=str(src.get("export_mode", SourceConfig.export_mode)),
             backfill_start_year=int(src.get("backfill_start_year", SourceConfig.backfill_start_year)),
         ),
         incremental=IncrementalConfig(

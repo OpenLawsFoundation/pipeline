@@ -2,8 +2,10 @@ name: adapter-it-backfill
 
 # One-shot full import: the "alba dei tempi" snapshot of the whole Italian corpus.
 # Manual only. The runner commits one act per commit directly to the archive repo,
-# so the archive's history grows act by act during the run. Each act is
-# multivigente: its entire legal time-history lives INSIDE the AKN document.
+# so the archive's history grows act by act during the run. Each act is fetched as
+# its CURRENT consolidated (vigente) version — one file carrying the in-force text
+# plus its full amendment apparatus in <lifecycle>/<analysis>, not the whole
+# version history (richiestaExport="V").
 #
 # A full corpus walk can exceed Actions' job time limit. If it does, run this on
 # a self-hosted runner (set runs-on accordingly) — the runner.run code is the

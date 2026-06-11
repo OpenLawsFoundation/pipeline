@@ -610,7 +610,7 @@ _AMEND_STEMS = ("amend", "modif", "novell", "aggiorn")
 def _passiveref_eids(tree: etree._Element) -> set[str]:
     """Collect eId values of ``<passiveRef>`` elements in ``<meta>/<references>``.
 
-    In real Normattiva consolidated documents (multivigente export), lifecycle
+    In real Normattiva consolidated documents (the vigente/consolidated export), lifecycle
     ``<eventRef>`` elements carry no ``@type``/``@refersTo`` — their only
     discriminator is the ``@source`` attribute, which is an IDREF into
     ``<meta>/<references>``.  A source that resolves to a ``<passiveRef>``
